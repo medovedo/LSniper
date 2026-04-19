@@ -36,7 +36,11 @@ namespace NinjaTrader.NinjaScript.Strategies
         public double EntryPrice;
         public bool BeTriggered;
         public double IntendedStopPrice; 
-        public bool StopAdjusted;        
+        
+        // NEU: Unabhängige Status-Tracker für sicheres SL-Management
+        public bool Stop1Adjusted;        
+        public bool RunnerStopAdjusted;
+        public bool DisplayNotified;
     }
 
     public class LotsenhofSniper : Strategy
@@ -76,6 +80,12 @@ namespace NinjaTrader.NinjaScript.Strategies
         [NinjaScriptProperty]
         [Display(Name="Inside-Bars blockieren", Description="Verhindert Trades, wenn die Signalkerze eine Inside-Bar ist.", Order=3, GroupName="1. Parameters")]
         public bool BlockInsideBars { get; set; }
+
+        // NEU: Slippage Airbag exklusiv für Momentum Orders
+        [NinjaScriptProperty]
+        [Range(0, 20)]
+        [Display(Name="Max Slippage (Ticks)", Description="Akzeptierte Slippage für Momentum Stop-Limit Orders.", Order=4, GroupName="1. Parameters")]
+        public int MaxSlippageTicks { get; set; }
 
         [NinjaScriptProperty]
         [Display(Name="Auto Break-Even aktivieren", Description="Zieht den Stop auf Entry, sobald Target 1 gefillt ist.", Order=1, GroupName="2. Auto-Breakeven")]
@@ -121,7 +131,7 @@ namespace NinjaTrader.NinjaScript.Strategies
         {
             if (State == State.SetDefaults)
             {
-                Description                 = "MAX STABILITY: Smart-Routing, dynamischer Pullback, Inside-Bar Blocker & Dynamische SL Anpassung.";
+                Description                 = "MAX STABILITY: Smart Pullback, Momentum Stop-Limit Airbag & Unabhängige SL Anpassung.";
                 Name                        = "Lotsenhof Sniper"; 
                 Calculate                   = Calculate.OnEachTick;
                 IsOverlay                   = true;
@@ -129,6 +139,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 AtmTemplateName             = "ATM 1 - 1"; 
                 MaxPullbackPercent          = 49.0; 
                 BlockInsideBars             = true; 
+                MaxSlippageTicks            = 2; // Default 2 Ticks Toleranz
                 
                 EnableAutoBreakeven         = true;
                 AutoBreakevenOffset         = 0;
@@ -272,16 +283,18 @@ namespace NinjaTrader.NinjaScript.Strategies
             }
 
             double entryPrice = h1 + tSize; 
+            double limitPrice = entryPrice + (MaxSlippageTicks * tSize); // NEU: Slippage Airbag berechnet
             double intendedStop = l1 - tSize; 
             string atmId = GetAtmStrategyUniqueId();
             string uniqueOrderId = "MomLong_" + atmId; 
             
-            lock(listLock) { trackedAtms[atmId] = new AtmState { AtmId = atmId, EntryOrderId = uniqueOrderId, Direction = AtmDirection.Long, EntryPrice = 0, BeTriggered = false, IntendedStopPrice = intendedStop, StopAdjusted = false }; }
+            lock(listLock) { trackedAtms[atmId] = new AtmState { AtmId = atmId, EntryOrderId = uniqueOrderId, Direction = AtmDirection.Long, EntryPrice = 0, BeTriggered = false, IntendedStopPrice = intendedStop, Stop1Adjusted = false, RunnerStopAdjusted = false, DisplayNotified = false }; }
             
-            if(c0 >= entryPrice) AtmStrategyCreate(OrderAction.Buy, OrderType.Limit, entryPrice, 0, TimeInForce.Gtc, uniqueOrderId, AtmTemplateName, atmId, (errorCode, errorId) => { });
-            else AtmStrategyCreate(OrderAction.Buy, OrderType.StopMarket, 0, entryPrice, TimeInForce.Gtc, uniqueOrderId, AtmTemplateName, atmId, (errorCode, errorId) => { });
+            // NEU: StopLimit Order Implementation
+            if(c0 >= entryPrice) AtmStrategyCreate(OrderAction.Buy, OrderType.Limit, limitPrice, 0, TimeInForce.Gtc, uniqueOrderId, AtmTemplateName, atmId, (errorCode, errorId) => { });
+            else AtmStrategyCreate(OrderAction.Buy, OrderType.StopLimit, limitPrice, entryPrice, TimeInForce.Gtc, uniqueOrderId, AtmTemplateName, atmId, (errorCode, errorId) => { });
             
-            Print($"[{DateTime.Now.ToString("HH:mm:ss.fff")}] MOMENTUM EXEKUTION: LONG platziert bei {entryPrice}.");
+            Print($"[{DateTime.Now.ToString("HH:mm:ss.fff")}] MOMENTUM EXEKUTION: LONG platziert bei {entryPrice} (Max Limit: {limitPrice}).");
         }
 
         private void ExecuteMomentumShort()
@@ -299,16 +312,18 @@ namespace NinjaTrader.NinjaScript.Strategies
             }
 
             double entryPrice = l1 - tSize;
+            double limitPrice = entryPrice - (MaxSlippageTicks * tSize); // NEU: Slippage Airbag berechnet
             double intendedStop = h1 + tSize; 
             string atmId = GetAtmStrategyUniqueId();
             string uniqueOrderId = "MomShort_" + atmId; 
             
-            lock(listLock) { trackedAtms[atmId] = new AtmState { AtmId = atmId, EntryOrderId = uniqueOrderId, Direction = AtmDirection.Short, EntryPrice = 0, BeTriggered = false, IntendedStopPrice = intendedStop, StopAdjusted = false }; }
+            lock(listLock) { trackedAtms[atmId] = new AtmState { AtmId = atmId, EntryOrderId = uniqueOrderId, Direction = AtmDirection.Short, EntryPrice = 0, BeTriggered = false, IntendedStopPrice = intendedStop, Stop1Adjusted = false, RunnerStopAdjusted = false, DisplayNotified = false }; }
             
-            if(c0 <= entryPrice) AtmStrategyCreate(OrderAction.Sell, OrderType.Limit, entryPrice, 0, TimeInForce.Gtc, uniqueOrderId, AtmTemplateName, atmId, (errorCode, errorId) => { });
-            else AtmStrategyCreate(OrderAction.Sell, OrderType.StopMarket, 0, entryPrice, TimeInForce.Gtc, uniqueOrderId, AtmTemplateName, atmId, (errorCode, errorId) => { });
+            // NEU: StopLimit Order Implementation
+            if(c0 <= entryPrice) AtmStrategyCreate(OrderAction.Sell, OrderType.Limit, limitPrice, 0, TimeInForce.Gtc, uniqueOrderId, AtmTemplateName, atmId, (errorCode, errorId) => { });
+            else AtmStrategyCreate(OrderAction.Sell, OrderType.StopLimit, limitPrice, entryPrice, TimeInForce.Gtc, uniqueOrderId, AtmTemplateName, atmId, (errorCode, errorId) => { });
             
-            Print($"[{DateTime.Now.ToString("HH:mm:ss.fff")}] MOMENTUM EXEKUTION: SHORT platziert bei {entryPrice}.");
+            Print($"[{DateTime.Now.ToString("HH:mm:ss.fff")}] MOMENTUM EXEKUTION: SHORT platziert bei {entryPrice} (Max Limit: {limitPrice}).");
         }
 
         private void ExecuteSmartLong()
@@ -338,7 +353,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 }
 
                 trapTriggerPrice = h1 + tSize;
-                trapLimitPrice = (l1 - tSize) + (12 * tSize);
+                trapLimitPrice = (l1 - tSize) + (12 * tSize); // ORIGINAL BEIBEHALTEN (Deep Pullback Limit)
                 trapStopLossPrice = l1 - tSize; 
                 trapBarNumber = bar;
                 trapLongActive = true;
@@ -380,7 +395,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 }
 
                 trapTriggerPrice = l1 - tSize;
-                trapLimitPrice = (h1 + tSize) - (12 * tSize);
+                trapLimitPrice = (h1 + tSize) - (12 * tSize); // ORIGINAL BEIBEHALTEN (Deep Pullback Limit)
                 trapStopLossPrice = h1 + tSize; 
                 trapBarNumber = bar;
                 trapShortActive = true;
@@ -420,8 +435,9 @@ namespace NinjaTrader.NinjaScript.Strategies
                 string atmId = GetAtmStrategyUniqueId();
                 string uniqueOrderId = "TrapLong_" + atmId;
                 
-                lock(listLock) { trackedAtms[atmId] = new AtmState { AtmId = atmId, EntryOrderId = uniqueOrderId, Direction = AtmDirection.Long, EntryPrice = 0, BeTriggered = false, IntendedStopPrice = trapStopLossPrice, StopAdjusted = false }; }
+                lock(listLock) { trackedAtms[atmId] = new AtmState { AtmId = atmId, EntryOrderId = uniqueOrderId, Direction = AtmDirection.Long, EntryPrice = 0, BeTriggered = false, IntendedStopPrice = trapStopLossPrice, Stop1Adjusted = false, RunnerStopAdjusted = false, DisplayNotified = false }; }
                 
+                // ORIGINAL: Bleibt eine reine Limit Order (wird in den Pullback gelegt)
                 AtmStrategyCreate(OrderAction.Buy, OrderType.Limit, trapLimitPrice, 0, TimeInForce.Gtc, uniqueOrderId, AtmTemplateName, atmId, (errorCode, errorId) => { });
             }
 
@@ -432,8 +448,9 @@ namespace NinjaTrader.NinjaScript.Strategies
                 string atmId = GetAtmStrategyUniqueId();
                 string uniqueOrderId = "TrapShort_" + atmId;
                 
-                lock(listLock) { trackedAtms[atmId] = new AtmState { AtmId = atmId, EntryOrderId = uniqueOrderId, Direction = AtmDirection.Short, EntryPrice = 0, BeTriggered = false, IntendedStopPrice = trapStopLossPrice, StopAdjusted = false }; }
+                lock(listLock) { trackedAtms[atmId] = new AtmState { AtmId = atmId, EntryOrderId = uniqueOrderId, Direction = AtmDirection.Short, EntryPrice = 0, BeTriggered = false, IntendedStopPrice = trapStopLossPrice, Stop1Adjusted = false, RunnerStopAdjusted = false, DisplayNotified = false }; }
                 
+                // ORIGINAL: Bleibt eine reine Limit Order (wird in den Pullback gelegt)
                 AtmStrategyCreate(OrderAction.Sell, OrderType.Limit, trapLimitPrice, 0, TimeInForce.Gtc, uniqueOrderId, AtmTemplateName, atmId, (errorCode, errorId) => { });
             }
 
@@ -446,6 +463,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                     {
                         AtmState state = kvp.Value;
                         
+                        // 1. Entry Preis ermitteln
                         if (state.EntryPrice == 0)
                         {
                             string[] entryStatus = GetAtmStrategyEntryOrderStatus(state.EntryOrderId);
@@ -463,22 +481,48 @@ namespace NinjaTrader.NinjaScript.Strategies
                             }
                         }
 
-                        if (state.EntryPrice != 0 && !state.StopAdjusted && state.IntendedStopPrice > 0)
+                        // 2. KORREKTUR: Unabhängige Überwachung der Stops zur Verhinderung der Race Condition
+                        if (state.EntryPrice != 0 && state.IntendedStopPrice > 0)
                         {
-                            string[,] s1Status = GetAtmStrategyStopTargetOrderStatus(Stop1Name, state.AtmId);
-                            if (s1Status != null && s1Status.GetLength(0) > 0 && s1Status.GetLength(1) > 2)
+                            // STOP 1 (Target 1 Stop) separat überwachen
+                            if (!state.Stop1Adjusted)
                             {
-                                string status = s1Status[0, 2];
-                                if (status == "Accepted" || status == "Working")
+                                string[,] s1Status = GetAtmStrategyStopTargetOrderStatus(Stop1Name, state.AtmId);
+                                if (s1Status != null && s1Status.GetLength(0) > 0 && s1Status.GetLength(1) > 2)
                                 {
-                                    AtmStrategyChangeStopTarget(0, state.IntendedStopPrice, Stop1Name, state.AtmId);
-                                    AtmStrategyChangeStopTarget(0, state.IntendedStopPrice, RunnerStopName, state.AtmId);
-                                    state.StopAdjusted = true;
-                                    Draw.TextFixed(this, "SL_Notice", $"SMART STOP: Gesichert auf {state.IntendedStopPrice}", TextPosition.BottomLeft, Brushes.Orange, new NinjaTrader.Gui.Tools.SimpleFont("Arial", 12) { Bold = true }, Brushes.Transparent, Brushes.Transparent, 0);
+                                    string status = s1Status[0, 2];
+                                    if (status == "Accepted" || status == "Working")
+                                    {
+                                        AtmStrategyChangeStopTarget(0, state.IntendedStopPrice, Stop1Name, state.AtmId);
+                                        state.Stop1Adjusted = true;
+                                    }
                                 }
+                            }
+
+                            // STOP 2 (Runner Stop) separat überwachen
+                            if (!state.RunnerStopAdjusted)
+                            {
+                                string[,] s2Status = GetAtmStrategyStopTargetOrderStatus(RunnerStopName, state.AtmId);
+                                if (s2Status != null && s2Status.GetLength(0) > 0 && s2Status.GetLength(1) > 2)
+                                {
+                                    string status = s2Status[0, 2];
+                                    if (status == "Accepted" || status == "Working")
+                                    {
+                                        AtmStrategyChangeStopTarget(0, state.IntendedStopPrice, RunnerStopName, state.AtmId);
+                                        state.RunnerStopAdjusted = true;
+                                    }
+                                }
+                            }
+
+                            // Grafik-Update nur einmal auf dem Chart auslösen
+                            if (state.Stop1Adjusted && !state.DisplayNotified)
+                            {
+                                state.DisplayNotified = true;
+                                Draw.TextFixed(this, "SL_Notice", $"SMART STOP: Gesichert auf {state.IntendedStopPrice}", TextPosition.BottomLeft, Brushes.Orange, new NinjaTrader.Gui.Tools.SimpleFont("Arial", 12) { Bold = true }, Brushes.Transparent, Brushes.Transparent, 0);
                             }
                         }
 
+                        // 3. Auto Break-Even Funktion
                         if (EnableAutoBreakeven && state.EntryPrice != 0 && !state.BeTriggered)
                         {
                             string[,] t1Status = GetAtmStrategyStopTargetOrderStatus(Target1Name, state.AtmId);
@@ -503,6 +547,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                             }
                         }
 
+                        // 4. ATM Bereinigung
                         if (state.EntryPrice != 0 && GetAtmStrategyPositionQuantity(state.AtmId) == 0)
                         {
                             deadAtms.Add(state.AtmId);
