@@ -1,0 +1,6 @@
+@SampleAtmStrategy.cs
+@SampleMACrossOver.cs
+@SampleMultiInstrument.cs
+@SampleMultiTimeFrame.cs
+@Strategy.cs
+TradeSimpleStrategies/PriceActionV4_1.cs
