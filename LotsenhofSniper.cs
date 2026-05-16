@@ -37,7 +37,6 @@ namespace NinjaTrader.NinjaScript.Strategies
         public bool BeTriggered;
         public double IntendedStopPrice; 
         
-        // NEU: Unabhängige Status-Tracker für sicheres SL-Management
         public bool Stop1Adjusted;        
         public bool RunnerStopAdjusted;
         public bool DisplayNotified;
@@ -49,10 +48,13 @@ namespace NinjaTrader.NinjaScript.Strategies
         private Button sellButton;
         private Button momentumBuyButton;
         private Button momentumSellButton;
+        // NEW MACK BUTTONS
+        private Button mackMomentumBuyButton;
+        private Button mackMomentumSellButton;
+        
         private Button cancelButton;
         private Grid myGrid;
         
-        // Trap State Variables
         private bool trapLongActive = false;
         private bool trapShortActive = false;
         private double trapTriggerPrice = 0.0;
@@ -60,7 +62,6 @@ namespace NinjaTrader.NinjaScript.Strategies
         private double trapStopLossPrice = 0.0; 
         private int trapBarNumber = 0;
         
-        // --- SCHATTEN-VARIABLEN (Erweitert um Bar 2) ---
         private double cHigh1, cLow1, cHigh2, cLow2, cClose0, cTickSize;
         private int cBar;
         private object dataLock = new object();
@@ -69,22 +70,26 @@ namespace NinjaTrader.NinjaScript.Strategies
         private Dictionary<string, AtmState> trackedAtms = new Dictionary<string, AtmState>();
         
         [NinjaScriptProperty]
-        [Display(Name="ATM Template Name", Description="Exakter Name des ATM Templates", Order=1, GroupName="1. Parameters")]
+        [Display(Name="ATM Template Name (WADE)", Description="Exakter Name des ATM Templates", Order=1, GroupName="1. Parameters")]
         public string AtmTemplateName { get; set; }
+
+        // NEW: ATM TEMPLATE PROPERTY FOR MACK
+        [NinjaScriptProperty]
+        [Display(Name="ATM Template MACK", Description="Exakter Name des ATM Templates fuer MACK", Order=2, GroupName="1. Parameters")]
+        public string AtmTemplateMack { get; set; }
 
         [NinjaScriptProperty]
         [Range(1.0, 100.0)]
-        [Display(Name="Max Pullback (%)", Description="Maximaler Pullback der Signalkerze in Prozent", Order=2, GroupName="1. Parameters")]
+        [Display(Name="Max Pullback (%)", Description="Maximaler Pullback der Signalkerze in Prozent", Order=3, GroupName="1. Parameters")]
         public double MaxPullbackPercent { get; set; }
 
         [NinjaScriptProperty]
-        [Display(Name="Inside-Bars blockieren", Description="Verhindert Trades, wenn die Signalkerze eine Inside-Bar ist.", Order=3, GroupName="1. Parameters")]
+        [Display(Name="Inside-Bars blockieren", Description="Verhindert Trades, wenn die Signalkerze eine Inside-Bar ist.", Order=4, GroupName="1. Parameters")]
         public bool BlockInsideBars { get; set; }
 
-        // NEU: Slippage Airbag exklusiv für Momentum Orders
         [NinjaScriptProperty]
         [Range(0, 20)]
-        [Display(Name="Max Slippage (Ticks)", Description="Akzeptierte Slippage für Momentum Stop-Limit Orders.", Order=4, GroupName="1. Parameters")]
+        [Display(Name="Max Slippage (Ticks)", Description="Akzeptierte Slippage für Momentum Stop-Limit Orders.", Order=5, GroupName="1. Parameters")]
         public int MaxSlippageTicks { get; set; }
 
         [NinjaScriptProperty]
@@ -137,9 +142,10 @@ namespace NinjaTrader.NinjaScript.Strategies
                 IsOverlay                   = true;
                 
                 AtmTemplateName             = "ATM 1 - 1"; 
+                AtmTemplateMack             = "Mack_4_1"; // Default MACK template name
                 MaxPullbackPercent          = 49.0; 
                 BlockInsideBars             = true; 
-                MaxSlippageTicks            = 2; // Default 2 Ticks Toleranz
+                MaxSlippageTicks            = 2; 
                 
                 EnableAutoBreakeven         = true;
                 AutoBreakevenOffset         = 0;
@@ -184,7 +190,8 @@ namespace NinjaTrader.NinjaScript.Strategies
                 Margin = new Thickness(0, 30, 10, 0)
             };
 
-            for(int i=0; i<5; i++) myGrid.RowDefinitions.Add(new RowDefinition());
+            // INCREASED ROW COUNT TO ACCOMMODATE MACK BUTTONS
+            for(int i=0; i<7; i++) myGrid.RowDefinitions.Add(new RowDefinition());
 
             buyButton = new Button { Content = "LONG (Smart)", Foreground = Brushes.White, Background = Brushes.DarkGreen, FontWeight = FontWeights.Bold, Margin = new Thickness(2), Padding = new Thickness(10, 5, 10, 5) };
             buyButton.Click += (o, e) => TriggerCustomEvent(state => ExecuteSmartLong(), null);
@@ -202,17 +209,28 @@ namespace NinjaTrader.NinjaScript.Strategies
             momentumSellButton.Click += (o, e) => TriggerCustomEvent(state => ExecuteMomentumShort(), null);
             Grid.SetRow(momentumSellButton, 3);
 
+            // MACK BUTTONS
+            mackMomentumBuyButton = new Button { Content = "MACK MOM. LONG", Foreground = Brushes.White, Background = Brushes.Green, FontWeight = FontWeights.Bold, Margin = new Thickness(2), Padding = new Thickness(10, 5, 10, 5) };
+            mackMomentumBuyButton.Click += (o, e) => TriggerCustomEvent(state => ExecuteMackMomentumLong(), null);
+            Grid.SetRow(mackMomentumBuyButton, 4);
+
+            mackMomentumSellButton = new Button { Content = "MACK MOM. SHORT", Foreground = Brushes.White, Background = Brushes.Firebrick, FontWeight = FontWeights.Bold, Margin = new Thickness(2), Padding = new Thickness(10, 5, 10, 5) };
+            mackMomentumSellButton.Click += (o, e) => TriggerCustomEvent(state => ExecuteMackMomentumShort(), null);
+            Grid.SetRow(mackMomentumSellButton, 5);
+
             cancelButton = new Button { Content = "CANCEL ALL", Foreground = Brushes.White, Background = Brushes.DarkOrange, FontWeight = FontWeights.Bold, Margin = new Thickness(2), Padding = new Thickness(10, 5, 10, 5) };
             cancelButton.Click += (o, e) => TriggerCustomEvent(state => ExecuteCancel(), null);
-            Grid.SetRow(cancelButton, 4);
+            Grid.SetRow(cancelButton, 6);
 
             myGrid.Children.Add(buyButton);
             myGrid.Children.Add(sellButton);
             myGrid.Children.Add(momentumBuyButton);
             myGrid.Children.Add(momentumSellButton);
+            myGrid.Children.Add(mackMomentumBuyButton);
+            myGrid.Children.Add(mackMomentumSellButton);
             myGrid.Children.Add(cancelButton);
 			
-			UserControlCollection.Add(myGrid);
+            UserControlCollection.Add(myGrid);
 
             if (ChartPanel != null) ChartPanel.PreviewKeyDown += ChartPanel_PreviewKeyDown;
         }
@@ -283,14 +301,13 @@ namespace NinjaTrader.NinjaScript.Strategies
             }
 
             double entryPrice = h1 + tSize; 
-            double limitPrice = entryPrice + (MaxSlippageTicks * tSize); // NEU: Slippage Airbag berechnet
+            double limitPrice = entryPrice + (MaxSlippageTicks * tSize); 
             double intendedStop = l1 - tSize; 
             string atmId = GetAtmStrategyUniqueId();
             string uniqueOrderId = "MomLong_" + atmId; 
             
             lock(listLock) { trackedAtms[atmId] = new AtmState { AtmId = atmId, EntryOrderId = uniqueOrderId, Direction = AtmDirection.Long, EntryPrice = 0, BeTriggered = false, IntendedStopPrice = intendedStop, Stop1Adjusted = false, RunnerStopAdjusted = false, DisplayNotified = false }; }
             
-            // NEU: StopLimit Order Implementation
             if(c0 >= entryPrice) AtmStrategyCreate(OrderAction.Buy, OrderType.Limit, limitPrice, 0, TimeInForce.Gtc, uniqueOrderId, AtmTemplateName, atmId, (errorCode, errorId) => { });
             else AtmStrategyCreate(OrderAction.Buy, OrderType.StopLimit, limitPrice, entryPrice, TimeInForce.Gtc, uniqueOrderId, AtmTemplateName, atmId, (errorCode, errorId) => { });
             
@@ -312,18 +329,76 @@ namespace NinjaTrader.NinjaScript.Strategies
             }
 
             double entryPrice = l1 - tSize;
-            double limitPrice = entryPrice - (MaxSlippageTicks * tSize); // NEU: Slippage Airbag berechnet
+            double limitPrice = entryPrice - (MaxSlippageTicks * tSize); 
             double intendedStop = h1 + tSize; 
             string atmId = GetAtmStrategyUniqueId();
             string uniqueOrderId = "MomShort_" + atmId; 
             
             lock(listLock) { trackedAtms[atmId] = new AtmState { AtmId = atmId, EntryOrderId = uniqueOrderId, Direction = AtmDirection.Short, EntryPrice = 0, BeTriggered = false, IntendedStopPrice = intendedStop, Stop1Adjusted = false, RunnerStopAdjusted = false, DisplayNotified = false }; }
             
-            // NEU: StopLimit Order Implementation
             if(c0 <= entryPrice) AtmStrategyCreate(OrderAction.Sell, OrderType.Limit, limitPrice, 0, TimeInForce.Gtc, uniqueOrderId, AtmTemplateName, atmId, (errorCode, errorId) => { });
             else AtmStrategyCreate(OrderAction.Sell, OrderType.StopLimit, limitPrice, entryPrice, TimeInForce.Gtc, uniqueOrderId, AtmTemplateName, atmId, (errorCode, errorId) => { });
             
             Print($"[{DateTime.Now.ToString("HH:mm:ss.fff")}] MOMENTUM EXEKUTION: SHORT platziert bei {entryPrice} (Max Limit: {limitPrice}).");
+        }
+
+        // NEW: MACK MOMENTUM EXECUTION METHODS
+        private void ExecuteMackMomentumLong()
+        {
+            RemoveDrawObject("SmartOrderError");
+            double h1, l1, h2, l2, c0, tSize; int bar;
+            lock(dataLock) { h1 = cHigh1; l1 = cLow1; h2 = cHigh2; l2 = cLow2; c0 = cClose0; bar = cBar; tSize = cTickSize; }
+            if (bar < 2) return;
+
+            if (BlockInsideBars && h1 <= h2 && l1 >= l2)
+            {
+                Draw.TextFixed(this, "SmartOrderError", $"FEHLER: Inside-Bar erkannt!\nTrade blockiert. Cancel drücken zum Ausblenden.", TextPosition.Center, Brushes.Red, new NinjaTrader.Gui.Tools.SimpleFont("Arial", 14) { Bold = true }, Brushes.Transparent, Brushes.Transparent, 0);
+                Print($"[{DateTime.Now.ToString("HH:mm:ss.fff")}] MACK MOMENTUM REJECTED (LONG): Inside-Bar erkannt.");
+                return;
+            }
+
+            double entryPrice = h1 + tSize; 
+            double limitPrice = entryPrice + (MaxSlippageTicks * tSize); 
+            double intendedStop = l1 - tSize; 
+            string atmId = GetAtmStrategyUniqueId();
+            string uniqueOrderId = "MackMomLong_" + atmId; 
+            
+            lock(listLock) { trackedAtms[atmId] = new AtmState { AtmId = atmId, EntryOrderId = uniqueOrderId, Direction = AtmDirection.Long, EntryPrice = 0, BeTriggered = false, IntendedStopPrice = intendedStop, Stop1Adjusted = false, RunnerStopAdjusted = false, DisplayNotified = false }; }
+            
+            // Uses AtmTemplateMack instead of AtmTemplateName
+            if(c0 >= entryPrice) AtmStrategyCreate(OrderAction.Buy, OrderType.Limit, limitPrice, 0, TimeInForce.Gtc, uniqueOrderId, AtmTemplateMack, atmId, (errorCode, errorId) => { });
+            else AtmStrategyCreate(OrderAction.Buy, OrderType.StopLimit, limitPrice, entryPrice, TimeInForce.Gtc, uniqueOrderId, AtmTemplateMack, atmId, (errorCode, errorId) => { });
+            
+            Print($"[{DateTime.Now.ToString("HH:mm:ss.fff")}] MACK MOMENTUM EXEKUTION: LONG platziert bei {entryPrice} (Max Limit: {limitPrice}).");
+        }
+
+        private void ExecuteMackMomentumShort()
+        {
+            RemoveDrawObject("SmartOrderError");
+            double h1, l1, h2, l2, c0, tSize; int bar;
+            lock(dataLock) { h1 = cHigh1; l1 = cLow1; h2 = cHigh2; l2 = cLow2; c0 = cClose0; bar = cBar; tSize = cTickSize; }
+            if (bar < 2) return;
+
+            if (BlockInsideBars && h1 <= h2 && l1 >= l2)
+            {
+                Draw.TextFixed(this, "SmartOrderError", $"FEHLER: Inside-Bar erkannt!\nTrade blockiert. Cancel drücken zum Ausblenden.", TextPosition.Center, Brushes.Red, new NinjaTrader.Gui.Tools.SimpleFont("Arial", 14) { Bold = true }, Brushes.Transparent, Brushes.Transparent, 0);
+                Print($"[{DateTime.Now.ToString("HH:mm:ss.fff")}] MACK MOMENTUM REJECTED (SHORT): Inside-Bar erkannt.");
+                return;
+            }
+
+            double entryPrice = l1 - tSize;
+            double limitPrice = entryPrice - (MaxSlippageTicks * tSize); 
+            double intendedStop = h1 + tSize; 
+            string atmId = GetAtmStrategyUniqueId();
+            string uniqueOrderId = "MackMomShort_" + atmId; 
+            
+            lock(listLock) { trackedAtms[atmId] = new AtmState { AtmId = atmId, EntryOrderId = uniqueOrderId, Direction = AtmDirection.Short, EntryPrice = 0, BeTriggered = false, IntendedStopPrice = intendedStop, Stop1Adjusted = false, RunnerStopAdjusted = false, DisplayNotified = false }; }
+            
+            // Uses AtmTemplateMack instead of AtmTemplateName
+            if(c0 <= entryPrice) AtmStrategyCreate(OrderAction.Sell, OrderType.Limit, limitPrice, 0, TimeInForce.Gtc, uniqueOrderId, AtmTemplateMack, atmId, (errorCode, errorId) => { });
+            else AtmStrategyCreate(OrderAction.Sell, OrderType.StopLimit, limitPrice, entryPrice, TimeInForce.Gtc, uniqueOrderId, AtmTemplateMack, atmId, (errorCode, errorId) => { });
+            
+            Print($"[{DateTime.Now.ToString("HH:mm:ss.fff")}] MACK MOMENTUM EXEKUTION: SHORT platziert bei {entryPrice} (Max Limit: {limitPrice}).");
         }
 
         private void ExecuteSmartLong()
@@ -353,7 +428,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 }
 
                 trapTriggerPrice = h1 + tSize;
-                trapLimitPrice = (l1 - tSize) + (12 * tSize); // ORIGINAL BEIBEHALTEN (Deep Pullback Limit)
+                trapLimitPrice = (l1 - tSize) + (12 * tSize); 
                 trapStopLossPrice = l1 - tSize; 
                 trapBarNumber = bar;
                 trapLongActive = true;
@@ -395,7 +470,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 }
 
                 trapTriggerPrice = l1 - tSize;
-                trapLimitPrice = (h1 + tSize) - (12 * tSize); // ORIGINAL BEIBEHALTEN (Deep Pullback Limit)
+                trapLimitPrice = (h1 + tSize) - (12 * tSize); 
                 trapStopLossPrice = h1 + tSize; 
                 trapBarNumber = bar;
                 trapShortActive = true;
@@ -412,7 +487,7 @@ namespace NinjaTrader.NinjaScript.Strategies
 
         protected override void OnBarUpdate()
         {
-            if (CurrentBar < 2) return; // Geändert auf < 2, damit Bar 2 für den Inside-Check existiert
+            if (CurrentBar < 2) return; 
 
             lock(dataLock)
             {
@@ -437,7 +512,6 @@ namespace NinjaTrader.NinjaScript.Strategies
                 
                 lock(listLock) { trackedAtms[atmId] = new AtmState { AtmId = atmId, EntryOrderId = uniqueOrderId, Direction = AtmDirection.Long, EntryPrice = 0, BeTriggered = false, IntendedStopPrice = trapStopLossPrice, Stop1Adjusted = false, RunnerStopAdjusted = false, DisplayNotified = false }; }
                 
-                // ORIGINAL: Bleibt eine reine Limit Order (wird in den Pullback gelegt)
                 AtmStrategyCreate(OrderAction.Buy, OrderType.Limit, trapLimitPrice, 0, TimeInForce.Gtc, uniqueOrderId, AtmTemplateName, atmId, (errorCode, errorId) => { });
             }
 
@@ -450,7 +524,6 @@ namespace NinjaTrader.NinjaScript.Strategies
                 
                 lock(listLock) { trackedAtms[atmId] = new AtmState { AtmId = atmId, EntryOrderId = uniqueOrderId, Direction = AtmDirection.Short, EntryPrice = 0, BeTriggered = false, IntendedStopPrice = trapStopLossPrice, Stop1Adjusted = false, RunnerStopAdjusted = false, DisplayNotified = false }; }
                 
-                // ORIGINAL: Bleibt eine reine Limit Order (wird in den Pullback gelegt)
                 AtmStrategyCreate(OrderAction.Sell, OrderType.Limit, trapLimitPrice, 0, TimeInForce.Gtc, uniqueOrderId, AtmTemplateName, atmId, (errorCode, errorId) => { });
             }
 
@@ -463,7 +536,6 @@ namespace NinjaTrader.NinjaScript.Strategies
                     {
                         AtmState state = kvp.Value;
                         
-                        // 1. Entry Preis ermitteln
                         if (state.EntryPrice == 0)
                         {
                             string[] entryStatus = GetAtmStrategyEntryOrderStatus(state.EntryOrderId);
@@ -481,10 +553,8 @@ namespace NinjaTrader.NinjaScript.Strategies
                             }
                         }
 
-                        // 2. KORREKTUR: Unabhängige Überwachung der Stops zur Verhinderung der Race Condition
                         if (state.EntryPrice != 0 && state.IntendedStopPrice > 0)
                         {
-                            // STOP 1 (Target 1 Stop) separat überwachen
                             if (!state.Stop1Adjusted)
                             {
                                 string[,] s1Status = GetAtmStrategyStopTargetOrderStatus(Stop1Name, state.AtmId);
@@ -499,7 +569,6 @@ namespace NinjaTrader.NinjaScript.Strategies
                                 }
                             }
 
-                            // STOP 2 (Runner Stop) separat überwachen
                             if (!state.RunnerStopAdjusted)
                             {
                                 string[,] s2Status = GetAtmStrategyStopTargetOrderStatus(RunnerStopName, state.AtmId);
@@ -514,7 +583,6 @@ namespace NinjaTrader.NinjaScript.Strategies
                                 }
                             }
 
-                            // Grafik-Update nur einmal auf dem Chart auslösen
                             if (state.Stop1Adjusted && !state.DisplayNotified)
                             {
                                 state.DisplayNotified = true;
@@ -522,7 +590,6 @@ namespace NinjaTrader.NinjaScript.Strategies
                             }
                         }
 
-                        // 3. Auto Break-Even Funktion
                         if (EnableAutoBreakeven && state.EntryPrice != 0 && !state.BeTriggered)
                         {
                             string[,] t1Status = GetAtmStrategyStopTargetOrderStatus(Target1Name, state.AtmId);
@@ -547,7 +614,6 @@ namespace NinjaTrader.NinjaScript.Strategies
                             }
                         }
 
-                        // 4. ATM Bereinigung
                         if (state.EntryPrice != 0 && GetAtmStrategyPositionQuantity(state.AtmId) == 0)
                         {
                             deadAtms.Add(state.AtmId);
