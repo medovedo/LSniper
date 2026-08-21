@@ -43,6 +43,9 @@ namespace NinjaTrader.NinjaScript.Strategies
         public bool RunnerStopAdjusted;
         public bool DisplayNotified;
         public double ScratchTargetPrice;
+        public double CurrentRunnerStop;
+        public bool PositionSeen;
+        public bool EntryComplete;
     }
 
     public class LotsenhofSniper : Strategy
@@ -122,8 +125,8 @@ namespace NinjaTrader.NinjaScript.Strategies
 
         [NinjaScriptProperty]
         [Range(1, 10)]
-        [Display(Name="Bars to Wait (Non-MACK)", Description="How many bars to keep a pending non-MACK limit order alive before automatic cancellation.", Order=9, GroupName="1. Parameters")]
-        public int BarsToWaitNonMack { get; set; }
+        [Display(Name="Bars to Wait", Description="How many bars to keep a pending limit order alive before automatic cancellation.", Order=9, GroupName="1. Parameters")]
+        public int BarsToWait { get; set; }
 
         [NinjaScriptProperty]
         [Display(Name="Show only Smart buttons", Description="If true, only smart long/short entry buttons are showed.", Order=10, GroupName="1. Parameters")]
@@ -168,6 +171,25 @@ namespace NinjaTrader.NinjaScript.Strategies
         public string RunnerTargetName { get; set; }
 
         [NinjaScriptProperty]
+        [Display(Name="Enable Auto Runner Trail", Description="After Auto-BE, automatically trails the runner stop behind confirmed swing points.", Order=1, GroupName="5. Runner Trail")]
+        public bool EnableRunnerTrail { get; set; }
+
+        [NinjaScriptProperty]
+        [Range(1, 10)]
+        [Display(Name="Swing Strength (Bars)", Description="Bars required on each side of a pivot to confirm it as a swing point.", Order=2, GroupName="5. Runner Trail")]
+        public int SwingStrength { get; set; }
+
+        [NinjaScriptProperty]
+        [Range(0, 100)]
+        [Display(Name="Min Swing Size (Ticks)", Description="Minimum prominence (pivot to opposing extreme since the pivot) for a swing to qualify. Filters out micro-swings so the trail respects meaningful structure only.", Order=3, GroupName="5. Runner Trail")]
+        public int MinSwingSizeTicks { get; set; }
+
+        [NinjaScriptProperty]
+        [Range(0, 20)]
+        [Display(Name="Trail Buffer (Ticks)", Description="Ticks beyond the swing point where the runner stop is placed.", Order=4, GroupName="5. Runner Trail")]
+        public int TrailBufferTicks { get; set; }
+
+        [NinjaScriptProperty]
         [Display(Name="Hotkey LONG (Smart)", Description="Key for Smart Long Entry", Order=1, GroupName="3. Hotkeys")]
         public SniperKey HotkeyLong { get; set; }
 
@@ -195,12 +217,12 @@ namespace NinjaTrader.NinjaScript.Strategies
         {
             if (State == State.SetDefaults)
             {
-                Description                 = "Lotsenhof Sniper: Deep Limit pullbacks for oversize bars & fixed offset limits for small bars.";
+                Description                 = "Lotsenhof Sniper: Smart PA entries with structural risk caps, auto break-even and swing-based runner trailing.";
                 Name                        = "LotsenhofSniper"; 
                 Calculate                   = Calculate.OnEachTick;
                 IsOverlay                   = true;
                 
-                AtmTemplatesList            = "Wade_1_to_1, Mack_4_1"; 
+                AtmTemplatesList            = "WADE10,WADE12,WADE14,WADE16,WADE8,WADE6"; 
                 MaxPullbackPercent          = 49.0; 
                 BlockInsideBars             = true; 
                 MaxSlippageTicks            = 2; 
@@ -211,7 +233,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 EnableAutoBreakeven         = true;
                 EnableTradingNonPerfectBars = false;
                 AutoBreakevenOffset         = 0;
-                BarsToWaitNonMack           = 3; // Standardmäßig bleiben Wade-Limit-Orders 3 Kerzen aktiv
+                BarsToWait                  = 3; // Pending limit orders stay alive for 3 bars
                 ShowOnlySmartButtons        = true;
                 Target1Name                 = "Target1";
                 Stop1Name                   = "Stop1";
@@ -219,6 +241,10 @@ namespace NinjaTrader.NinjaScript.Strategies
                 RiskToleranceTicks          = 2; // Standardmäßig 2 Ticks "Gummiband"
                 ScratchOffsetTicks          = 2;
                 RunnerTargetName            = "Target2";
+                EnableRunnerTrail           = true;
+                SwingStrength               = 2;
+                MinSwingSizeTicks           = 8;  // pivot must protrude at least 2 points on ES
+                TrailBufferTicks            = 1;
 
                 HotkeyLong                  = SniperKey.W;
                 HotkeyShort                 = SniperKey.S; 
@@ -268,6 +294,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 RemoveDrawObject("BE_Notice");
                 RemoveDrawObject("SL_Notice");
                 RemoveDrawObject("Scratch_Notice");
+                RemoveDrawObject("Trail_Notice");
                 lock(listLock) { trackedAtms.Clear(); }
             }
         }
@@ -399,6 +426,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             RemoveDrawObject("BE_Notice");
             RemoveDrawObject("SL_Notice");
             RemoveDrawObject("Scratch_Notice");
+            RemoveDrawObject("Trail_Notice");
 
             lock(listLock)
             {
@@ -423,9 +451,11 @@ namespace NinjaTrader.NinjaScript.Strategies
 
             int livePositions = 0;
             int adjustedTargets = 0;
+            int trackedCount = 0;
 
             lock(listLock)
             {
+                trackedCount = trackedAtms.Count;
                 foreach (var kvp in trackedAtms)
                 {
                     AtmState state = kvp.Value;
@@ -448,7 +478,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                     }
 
                     if (PullTargetToScratch(Target1Name, state.AtmId, scratchPrice)) adjustedTargets++;
-                    if (PullTargetToScratch(RunnerTargetName, state.AtmId, scratchPrice)) adjustedTargets++;
+                    if (state.EntryComplete && PullTargetToScratch(RunnerTargetName, state.AtmId, scratchPrice)) adjustedTargets++;
                     state.ScratchTargetPrice = scratchPrice;
                 }
             }
@@ -456,6 +486,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             if (livePositions == 0)
             {
                 Draw.TextFixed(this, "SmartOrderError", "ERROR: No active position to scratch!", TextPosition.Center, Brushes.Red, new NinjaTrader.Gui.Tools.SimpleFont("Arial", 14) { Bold = true }, Brushes.Transparent, Brushes.Transparent, 0);
+                Print($"[{DateTime.Now.ToString("HH:mm:ss.fff")}] Scratch ignored: no filled ATM position ({trackedCount} tracked).");
                 return;
             }
 
@@ -480,7 +511,9 @@ namespace NinjaTrader.NinjaScript.Strategies
             string orderState = status[0, 2];
             if (orderState != "Accepted" && orderState != "Working") return false;
 
-            AtmStrategyChangeStopTarget(0, price, targetName, atmId);
+            // Achtung Reihenfolge: (limitPrice, stopPrice, ...). Targets sind Limit-Orders,
+            // der Preis gehoert also in den ERSTEN Parameter (Stops in den zweiten).
+            AtmStrategyChangeStopTarget(price, 0, targetName, atmId);
             return true;
         }
 
@@ -605,38 +638,6 @@ namespace NinjaTrader.NinjaScript.Strategies
             double structuralRiskTicks = Math.Round((triggerPrice - structuralStop) / tSize);
             double totalStructureSize = Math.Round((h1 - Math.Min(l1, l2)) / tSize); 
 
-            // --- MACK-WEICHE ---
-            string selectedAtm = availableAtms[currentAtmIndex];
-            if (selectedAtm.ToUpper().Contains("MACK"))
-            {
-                double stopLimitPrice = triggerPrice + tSize; 
-                string atmId = GetAtmStrategyUniqueId();
-                string uniqueOrderId = "SmartMackLong_" + atmId;
-                
-                lock(listLock) 
-                { 
-                    trackedAtms[atmId] = new AtmState 
-                    { 
-                        AtmId = atmId, 
-                        EntryOrderId = uniqueOrderId, 
-                        Direction = AtmDirection.Long, 
-                        EntryPrice = 0, 
-                        BeTriggered = false, 
-                        IntendedStopPrice = structuralStop, 
-                        TriggerPrice = triggerPrice, 
-                        SetupBarIndex = bar, 
-                        Stop1Adjusted = false, 
-                        RunnerStopAdjusted = false, 
-                        DisplayNotified = false,
-                        ScratchTargetPrice = 0
-                    }; 
-                }
-                
-                AtmStrategyCreate(OrderAction.Buy, OrderType.StopLimit, stopLimitPrice, triggerPrice, TimeInForce.Gtc, uniqueOrderId, selectedAtm, atmId, (errorCode, errorId) => { });
-                RemoveDrawObject("SmartOrderError");
-                Print($"[{DateTime.Now.ToString("HH:mm:ss.fff")}] MACK Long Stop-Limit Armed. Trigger: {triggerPrice}, Limit: {stopLimitPrice}, SL: {structuralStop}");
-                return; 
-            }
 
             if (!EnableTradingNonPerfectBars && close1 < ((h1 + l1) / 2)) {
                 Draw.TextFixed(this, "SmartOrderError", "ERROR: Bar did not close in the upper half!", TextPosition.Center, Brushes.Red, new NinjaTrader.Gui.Tools.SimpleFont("Arial", 14) { Bold = true }, Brushes.Transparent, Brushes.Transparent, 0);
@@ -698,38 +699,6 @@ namespace NinjaTrader.NinjaScript.Strategies
             double structuralRiskTicks = Math.Round((structuralStop - triggerPrice) / tSize);
             double totalStructureSize = Math.Round((Math.Max(h1, h2) - l1) / tSize); 
 
-            // --- MACK-WEICHE ---
-            string selectedAtm = availableAtms[currentAtmIndex];
-            if (selectedAtm.ToUpper().Contains("MACK"))
-            {
-                double stopLimitPrice = triggerPrice - tSize; 
-                string atmId = GetAtmStrategyUniqueId();
-                string uniqueOrderId = "SmartMackShort_" + atmId;
-                
-                lock(listLock) 
-                { 
-                    trackedAtms[atmId] = new AtmState 
-                    { 
-                        AtmId = atmId, 
-                        EntryOrderId = uniqueOrderId, 
-                        Direction = AtmDirection.Short, 
-                        EntryPrice = 0, 
-                        BeTriggered = false, 
-                        IntendedStopPrice = structuralStop, 
-                        TriggerPrice = triggerPrice, 
-                        SetupBarIndex = bar, 
-                        Stop1Adjusted = false, 
-                        RunnerStopAdjusted = false, 
-                        DisplayNotified = false,
-                        ScratchTargetPrice = 0
-                    }; 
-                }
-                
-                AtmStrategyCreate(OrderAction.Sell, OrderType.StopLimit, stopLimitPrice, triggerPrice, TimeInForce.Gtc, uniqueOrderId, selectedAtm, atmId, (errorCode, errorId) => { });
-                RemoveDrawObject("SmartOrderError");
-                Print($"[{DateTime.Now.ToString("HH:mm:ss.fff")}] MACK Short Stop-Limit Armed. Trigger: {triggerPrice}, Limit: {stopLimitPrice}, SL: {structuralStop}");
-                return; 
-            }
 
             if (!EnableTradingNonPerfectBars && close1 > ((h1 + l1) / 2) ) {
                 Draw.TextFixed(this, "SmartOrderError", "ERROR: Bar did not close in the lower half!", TextPosition.Center, Brushes.Red, new NinjaTrader.Gui.Tools.SimpleFont("Arial", 14) { Bold = true }, Brushes.Transparent, Brushes.Transparent, 0);
@@ -860,9 +829,86 @@ namespace NinjaTrader.NinjaScript.Strategies
             RemoveDrawObject("SmartOrderError");
         }
 
+        private void ManageRunnerTrail(AtmState state)
+        {
+            if (CurrentBar < (2 * SwingStrength) + 2) return;
+
+            double tSize = TickSize;
+            int lookback = Math.Min(CurrentBar - SwingStrength - 1, 100);
+
+            // Scan from the most recent confirmed pivot backwards; stop at the setup bar.
+            for (int p = SwingStrength + 1; p <= lookback; p++)
+            {
+                int pivotAbsoluteBar = CurrentBar - p;
+                if (pivotAbsoluteBar <= state.SetupBarIndex) break; // only swings formed after entry
+
+                if (state.Direction == AtmDirection.Long)
+                {
+                    double pivotLow = Low[p];
+                    bool isPivot = true;
+                    for (int k = 1; k <= SwingStrength; k++)
+                    {
+                        // newer side must be strictly higher; older side may be equal (double bottom)
+                        if (Low[p - k] <= pivotLow || Low[p + k] < pivotLow) { isPivot = false; break; }
+                    }
+                    if (!isPivot) continue;
+
+                    // Prominence: how far price has rallied off this low since the pivot formed
+                    double maxHighSince = High[0];
+                    for (int j = 0; j < p; j++) if (High[j] > maxHighSince) maxHighSince = High[j];
+                    if ((maxHighSince - pivotLow) / tSize < MinSwingSizeTicks) continue; // micro-swing: ignore
+
+                    double candidate = pivotLow - (TrailBufferTicks * tSize);
+                    if (candidate <= state.CurrentRunnerStop) return; // tighten-only
+                    if (candidate >= Close[0]) return;                // never place at/through market
+
+                    TryMoveRunnerStop(state, candidate);
+                    return;
+                }
+                else
+                {
+                    double pivotHigh = High[p];
+                    bool isPivot = true;
+                    for (int k = 1; k <= SwingStrength; k++)
+                    {
+                        if (High[p - k] >= pivotHigh || High[p + k] > pivotHigh) { isPivot = false; break; }
+                    }
+                    if (!isPivot) continue;
+
+                    double minLowSince = Low[0];
+                    for (int j = 0; j < p; j++) if (Low[j] < minLowSince) minLowSince = Low[j];
+                    if ((pivotHigh - minLowSince) / tSize < MinSwingSizeTicks) continue;
+
+                    double candidate = pivotHigh + (TrailBufferTicks * tSize);
+                    if (state.CurrentRunnerStop != 0 && candidate >= state.CurrentRunnerStop) return; // tighten-only
+                    if (candidate <= Close[0]) return;
+
+                    TryMoveRunnerStop(state, candidate);
+                    return;
+                }
+            }
+        }
+
+        private void TryMoveRunnerStop(AtmState state, double price)
+        {
+            string[,] status = GetAtmStrategyStopTargetOrderStatus(RunnerStopName, state.AtmId);
+            if (status == null || status.GetLength(0) == 0 || status.GetLength(1) <= 2) return;
+
+            string orderState = status[0, 2];
+            if (orderState != "Accepted" && orderState != "Working") return;
+
+            AtmStrategyChangeStopTarget(0, price, RunnerStopName, state.AtmId);
+            state.CurrentRunnerStop = price;
+            RemoveDrawObject("BE_Notice");
+            Draw.TextFixed(this, "Trail_Notice", $"TRAIL: {RunnerStopName} secured at {price}", TextPosition.BottomRight, Brushes.DeepSkyBlue, new NinjaTrader.Gui.Tools.SimpleFont("Arial", 12) { Bold = true }, Brushes.Transparent, Brushes.Transparent, 0);
+            Print($"[{DateTime.Now.ToString("HH:mm:ss.fff")}] Runner trail: {RunnerStopName} moved to {price} (swing-based).");
+        }
+
         protected override void OnBarUpdate()
         {
             if (CurrentBar < 2) return; 
+
+            bool isNewBar = IsFirstTickOfBar;
 
             lock(dataLock)
             {
@@ -933,8 +979,8 @@ namespace NinjaTrader.NinjaScript.Strategies
                                 }
                             }
 
-                            // --- DYNAMISCHER BAR EXPIRATION CHECK ---
-                            int maxBarsToWait = state.EntryOrderId.ToLower().Contains("mack") ? 1 : BarsToWaitNonMack;
+                            // --- BAR EXPIRATION CHECK ---
+                            int maxBarsToWait = BarsToWait;
                             if (cBar >= state.SetupBarIndex + maxBarsToWait)
                             {
                                 Print($"[{DateTime.Now.ToString("HH:mm:ss.fff")}] Smart Order EXPIRED: Allowed bars exceeded (Current: {cBar}, Setup: {state.SetupBarIndex}, Allowed: {maxBarsToWait}). Cancelling Live Order.");
@@ -943,7 +989,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                                 deadAtms.Add(state.AtmId);
                                 continue;
                             }
-                            // --- ENDE DYNAMISCHER CHECK ---
+                            // --- END BAR EXPIRATION CHECK ---
 
                             string[] entryStatus = GetAtmStrategyEntryOrderStatus(state.EntryOrderId);
                             if (entryStatus != null && entryStatus.Length > 2)
@@ -957,6 +1003,29 @@ namespace NinjaTrader.NinjaScript.Strategies
                                         state.EntryPrice = parsedPrice;
                                     }
                                 }
+                            }
+                        }
+
+                        // Sobald die Position einmal da war und jetzt weg ist, ist die ATM terminiert.
+                        // Ab hier keine Statusabfragen mehr, sonst loggt NT "ATM strategy ID does not exist".
+                        int atmQty = state.EntryPrice != 0 ? GetAtmStrategyPositionQuantity(state.AtmId) : 0;
+                        if (atmQty > 0) state.PositionSeen = true;
+                        if (state.PositionSeen && atmQty == 0)
+                        {
+                            deadAtms.Add(state.AtmId);
+                            continue;
+                        }
+
+                        // Der Runner-Bracket entsteht erst mit der letzten Entry-Execution.
+                        // Solange die Entry-Order noch Fills liefern kann, fragen wir Stop2/Target2
+                        // gar nicht erst ab - sonst loggt NT "Order name 'Stop2' is invalid".
+                        if (!state.EntryComplete)
+                        {
+                            string[] eStatus = GetAtmStrategyEntryOrderStatus(state.EntryOrderId);
+                            if (eStatus != null && eStatus.Length > 2)
+                            {
+                                string eState = eStatus[2];
+                                if (eState == "Filled" || eState == "Cancelled" || eState == "Rejected") state.EntryComplete = true;
                             }
                         }
 
@@ -976,7 +1045,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                                 }
                             }
 
-                            if (!state.RunnerStopAdjusted)
+                            if (state.EntryComplete && !state.RunnerStopAdjusted)
                             {
                                 string[,] s2Status = GetAtmStrategyStopTargetOrderStatus(RunnerStopName, state.AtmId);
                                 if (s2Status != null && s2Status.GetLength(0) > 0 && s2Status.GetLength(1) > 2)
@@ -986,6 +1055,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                                     {
                                         AtmStrategyChangeStopTarget(0, state.IntendedStopPrice, RunnerStopName, state.AtmId);
                                         state.RunnerStopAdjusted = true;
+                                        state.CurrentRunnerStop = state.IntendedStopPrice;
                                     }
                                 }
                             }
@@ -1014,6 +1084,7 @@ namespace NinjaTrader.NinjaScript.Strategies
 
                                     AtmStrategyChangeStopTarget(0, bePrice, RunnerStopName, state.AtmId);
                                     state.BeTriggered = true;
+                                    state.CurrentRunnerStop = bePrice;
                                     
                                     RemoveDrawObject("SL_Notice");
                                     Draw.TextFixed(this, "BE_Notice", $"AUTO-BE: {RunnerStopName} secured at entry!", TextPosition.BottomRight, Brushes.LimeGreen, new NinjaTrader.Gui.Tools.SimpleFont("Arial", 12) { Bold = true }, Brushes.Transparent, Brushes.Transparent, 0);
@@ -1021,13 +1092,20 @@ namespace NinjaTrader.NinjaScript.Strategies
                             }
                         }
 
-                        if (state.EntryPrice != 0 && GetAtmStrategyPositionQuantity(state.AtmId) == 0) deadAtms.Add(state.AtmId);
+                        if (EnableRunnerTrail && state.BeTriggered && isNewBar)
+                        {
+                            ManageRunnerTrail(state);
+                        }
+
+                        // Fallback fuer den Fall, dass Fill und Close auf denselben Tick fallen.
+                        if (state.EntryPrice != 0 && atmQty == 0) deadAtms.Add(state.AtmId);
                     }
                     
                     foreach(string id in deadAtms) 
                     {
                         trackedAtms.Remove(id);
                         RemoveDrawObject("BE_Notice");
+                        RemoveDrawObject("Trail_Notice");
                         RemoveDrawObject("SL_Notice");
                         RemoveDrawObject("Scratch_Notice");
                     }
