@@ -2,6 +2,7 @@
 using System;
 using System.Collections.Generic;
 using System.ComponentModel.DataAnnotations;
+using System.Text.RegularExpressions;
 using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Media;
@@ -36,8 +37,8 @@ namespace NinjaTrader.NinjaScript.Strategies
         public double EntryPrice;
         public bool BeTriggered;
         public double IntendedStopPrice; 
-        
-        // Independent status trackers for secure SL management
+        public double TriggerPrice;
+        public int SetupBarIndex;
         public bool Stop1Adjusted;        
         public bool RunnerStopAdjusted;
         public bool DisplayNotified;
@@ -69,9 +70,10 @@ namespace NinjaTrader.NinjaScript.Strategies
         private double trapLimitPrice = 0.0;
         private double trapStopLossPrice = 0.0; 
         private int trapBarNumber = 0;
+        private int MaxRiskTicks = 0;
         
-        // Shadow Variables (Extended to Bar 2)
-        private double cHigh1, cLow1, cHigh2, cLow2, cClose0, cTickSize;
+        // Market Data Shadow Variables
+        private double cHigh1, cLow1, cOpen1, cClose1, cHigh2, cLow2, cClose0, cTickSize;
         private int cBar;
         private object dataLock = new object();
         private object listLock = new object();
@@ -96,11 +98,43 @@ namespace NinjaTrader.NinjaScript.Strategies
         [Display(Name="Max Slippage (Ticks)", Description="Accepted slippage for momentum stop-limit orders.", Order=4, GroupName="1. Parameters")]
         public int MaxSlippageTicks { get; set; }
 
-        // NEW: Max Risk Property
         [NinjaScriptProperty]
         [Range(1, 100)]
-        [Display(Name="Max Risk (Ticks)", Description="Maximum allowed risk in ticks. Caps the stop loss distance automatically.", Order=5, GroupName="1. Parameters")]
-        public int MaxRiskTicks { get; set; }
+        [Display(Name="Max Risk (Ticks)", Description="Maximum allowed risk in ticks. Dynamically adjusts limit entry relative to safe structural stop.", Order=5, GroupName="1. Parameters")]
+        public int DefaultMaxRiskTicks { get; set; }
+
+        [NinjaScriptProperty]
+        [Range(0, 50)]
+        [Display(Name="Smart Entry Offset (Ticks)", Description="Ticks to offset the limit order from the trigger (applies only to candles <= Max Risk).", Order=6, GroupName="1. Parameters")]
+        public int SmartOffsetTicks { get; set; }
+
+        [NinjaScriptProperty]
+        [Range(1, 100)]
+        [Display(Name="Min Body Ratio (%)", Description="Minimum required percentage of the candle body relative to the total candle size to filter out indecisive Dojis.", Order=7, GroupName="1. Parameters")]
+        public int MinBodyRatioPercent { get; set; }
+
+        [NinjaScriptProperty]
+        [Range(1, 100)]
+        [Display(Name="Max Runway (Ticks)", Description="Cancel the unfilled limit order if price moves this many ticks past the trigger without filling.", Order=8, GroupName="1. Parameters")]
+        public int MaxRunwayTicks { get; set; }
+
+        [NinjaScriptProperty]
+        [Range(1, 10)]
+        [Display(Name="Bars to Wait (Non-MACK)", Description="How many bars to keep a pending non-MACK limit order alive before automatic cancellation.", Order=9, GroupName="1. Parameters")]
+        public int BarsToWaitNonMack { get; set; }
+
+        [NinjaScriptProperty]
+        [Display(Name="Show only Smart buttons", Description="If true, only smart long/short entry buttons are showed.", Order=10, GroupName="1. Parameters")]
+        public bool ShowOnlySmartButtons { get; set; }
+        
+        [NinjaScriptProperty]
+        [Display(Name="Enable non perfect signal bars", Description="If enabled, you can enter long on a red bar and vice versa and a doji as well", Order=11, GroupName="1. Parameters")]
+        public bool EnableTradingNonPerfectBars { get; set; }
+
+        [NinjaScriptProperty]
+        [Range(0, 10)]
+        [Display(Name="Risk Tolerance (Ticks)", Description="Erlaubt der Signal-Bar, das eingestellte Max Risk um X Ticks zu überschreiten, ohne geblockt/tief gesetzt zu werden (z.B. für leichte Overshoots).", Order=6, GroupName="1. Parameters")]
+        public int RiskToleranceTicks { get; set; }
 
         [NinjaScriptProperty]
         [Display(Name="Enable Auto Break-Even", Description="Moves stop to entry as soon as Target 1 is filled.", Order=1, GroupName="2. Auto-Breakeven")]
@@ -146,7 +180,7 @@ namespace NinjaTrader.NinjaScript.Strategies
         {
             if (State == State.SetDefaults)
             {
-                Description                 = "MAX STABILITY: Smart Pullback, Momentum Stop-Limit Airbag, Independent SL & Max Risk Cap.";
+                Description                 = "Lotsenhof Sniper: Deep Limit pullbacks for oversize bars & fixed offset limits for small bars.";
                 Name                        = "LotsenhofSniper"; 
                 Calculate                   = Calculate.OnEachTick;
                 IsOverlay                   = true;
@@ -154,14 +188,20 @@ namespace NinjaTrader.NinjaScript.Strategies
                 AtmTemplatesList            = "Wade_1_to_1, Mack_4_1"; 
                 MaxPullbackPercent          = 49.0; 
                 BlockInsideBars             = true; 
-                MaxSlippageTicks            = 2; // Default 2 Ticks Tolerance
-                MaxRiskTicks                = 15; // Default Max Risk Cap
-                
+                MaxSlippageTicks            = 2; 
+                DefaultMaxRiskTicks         = 9; 
+                SmartOffsetTicks            = 2;
+                MinBodyRatioPercent         = 10; 
+                MaxRunwayTicks              = 10;              
                 EnableAutoBreakeven         = true;
+                EnableTradingNonPerfectBars = false;
                 AutoBreakevenOffset         = 0;
+                BarsToWaitNonMack           = 3; // Standardmäßig bleiben Wade-Limit-Orders 3 Kerzen aktiv
+                ShowOnlySmartButtons        = true;
                 Target1Name                 = "Target1";
                 Stop1Name                   = "Stop1";
                 RunnerStopName              = "Stop2";
+                RiskToleranceTicks          = 2; // Standardmäßig 2 Ticks "Gummiband"
                 
                 HotkeyLong                  = SniperKey.W; 
                 HotkeyShort                 = SniperKey.S; 
@@ -184,6 +224,12 @@ namespace NinjaTrader.NinjaScript.Strategies
                     }
                 }
                 currentAtmIndex = 0;
+                Match match = Regex.Match(availableAtms[currentAtmIndex], @"\d+");
+                if (match.Success) {
+                    MaxRiskTicks = int.Parse(match.Value) - 1;
+                } else {
+                    MaxRiskTicks = DefaultMaxRiskTicks;
+                }
             }
             else if (State == State.Historical)
             {
@@ -234,7 +280,13 @@ namespace NinjaTrader.NinjaScript.Strategies
                     currentAtmIndex++;
                     if (currentAtmIndex >= availableAtms.Length) currentAtmIndex = 0;
                     atmToggleButton.Content = $"ATM: {availableAtms[currentAtmIndex]}";
-                    Print($"[{DateTime.Now.ToString("HH:mm:ss.fff")}] ATM Switched to: {availableAtms[currentAtmIndex]}");
+                    Match match = Regex.Match(availableAtms[currentAtmIndex], @"\d+");
+                    if (match.Success) {
+                        MaxRiskTicks = int.Parse(match.Value) - 1;
+                    } else {
+                        MaxRiskTicks = DefaultMaxRiskTicks;
+                    }
+                    Print($"[{DateTime.Now.ToString("HH:mm:ss.fff")}] ATM Switched to: {availableAtms[currentAtmIndex]} and Risk to: {MaxRiskTicks}");
                 });
             };
             Grid.SetRow(atmToggleButton, 0);
@@ -270,10 +322,12 @@ namespace NinjaTrader.NinjaScript.Strategies
             myGrid.Children.Add(atmToggleButton);
             myGrid.Children.Add(buyButton);
             myGrid.Children.Add(sellButton);
-            myGrid.Children.Add(deepBuyButton);
-            myGrid.Children.Add(deepSellButton);
-            myGrid.Children.Add(momentumBuyButton);
-            myGrid.Children.Add(momentumSellButton);
+            if (!ShowOnlySmartButtons){
+                myGrid.Children.Add(deepBuyButton);
+                myGrid.Children.Add(deepSellButton);
+                myGrid.Children.Add(momentumBuyButton);
+                myGrid.Children.Add(momentumSellButton);
+            }
             myGrid.Children.Add(cancelButton);
             
             UserControlCollection.Add(myGrid);
@@ -329,20 +383,20 @@ namespace NinjaTrader.NinjaScript.Strategies
                 }
                 trackedAtms.Clear();
             }
-            Print($"[{DateTime.Now.ToString("HH:mm:ss.fff")}] LotsenhofSniper: Killswitch activated. All orders & traps CANCELLED.");
+            Print($"[{DateTime.Now.ToString("HH:mm:ss.fff")}] Killswitch activated. All traps and active orders destroyed.");
         }
 
         private void ExecuteMomentumLong()
         {
             RemoveDrawObject("SmartOrderError");
             double h1, l1, h2, l2, c0, tSize; int bar;
+            
             lock(dataLock) { h1 = cHigh1; l1 = cLow1; h2 = cHigh2; l2 = cLow2; c0 = cClose0; bar = cBar; tSize = cTickSize; }
             if (bar < 2) return;
 
             if (BlockInsideBars && h1 <= h2 && l1 >= l2)
             {
-                Draw.TextFixed(this, "SmartOrderError", $"ERROR: Inside Bar detected!\nTrade blocked. Press Cancel to hide.", TextPosition.Center, Brushes.Red, new NinjaTrader.Gui.Tools.SimpleFont("Arial", 14) { Bold = true }, Brushes.Transparent, Brushes.Transparent, 0);
-                Print($"[{DateTime.Now.ToString("HH:mm:ss.fff")}] MOMENTUM REJECTED (LONG): Inside Bar detected.");
+                Draw.TextFixed(this, "SmartOrderError", "ERROR: Inside Bar blocked!", TextPosition.Center, Brushes.Red, new NinjaTrader.Gui.Tools.SimpleFont("Arial", 14) { Bold = true }, Brushes.Transparent, Brushes.Transparent, 0);
                 return;
             }
 
@@ -355,32 +409,45 @@ namespace NinjaTrader.NinjaScript.Strategies
             if (riskTicks > MaxRiskTicks)
             {
                 intendedStop = entryPrice - (MaxRiskTicks * tSize);
-                Print($"[{DateTime.Now.ToString("HH:mm:ss.fff")}] WARNING: Structural risk ({riskTicks} ticks) exceeds max. SL capped at {MaxRiskTicks} ticks.");
             }
 
             string atmId = GetAtmStrategyUniqueId();
             string uniqueOrderId = "MomLong_" + atmId; 
             string selectedAtm = availableAtms[currentAtmIndex];
             
-            lock(listLock) { trackedAtms[atmId] = new AtmState { AtmId = atmId, EntryOrderId = uniqueOrderId, Direction = AtmDirection.Long, EntryPrice = 0, BeTriggered = false, IntendedStopPrice = intendedStop, Stop1Adjusted = false, RunnerStopAdjusted = false, DisplayNotified = false }; }
+            lock(listLock) 
+            { 
+                trackedAtms[atmId] = new AtmState 
+                { 
+                    AtmId = atmId, 
+                    EntryOrderId = uniqueOrderId, 
+                    Direction = AtmDirection.Long, 
+                    EntryPrice = 0, 
+                    BeTriggered = false, 
+                    IntendedStopPrice = intendedStop, 
+                    TriggerPrice = entryPrice, 
+                    SetupBarIndex = bar, 
+                    Stop1Adjusted = false, 
+                    RunnerStopAdjusted = false, 
+                    DisplayNotified = false 
+                }; 
+            }
             
             if(c0 >= entryPrice) AtmStrategyCreate(OrderAction.Buy, OrderType.Limit, limitPrice, 0, TimeInForce.Gtc, uniqueOrderId, selectedAtm, atmId, (errorCode, errorId) => { });
             else AtmStrategyCreate(OrderAction.Buy, OrderType.StopLimit, limitPrice, entryPrice, TimeInForce.Gtc, uniqueOrderId, selectedAtm, atmId, (errorCode, errorId) => { });
-            
-            Print($"[{DateTime.Now.ToString("HH:mm:ss.fff")}] MOMENTUM EXECUTION ({selectedAtm}): LONG placed at {entryPrice} (Max Limit: {limitPrice}).");
         }
 
         private void ExecuteMomentumShort()
         {
             RemoveDrawObject("SmartOrderError");
             double h1, l1, h2, l2, c0, tSize; int bar;
+            
             lock(dataLock) { h1 = cHigh1; l1 = cLow1; h2 = cHigh2; l2 = cLow2; c0 = cClose0; bar = cBar; tSize = cTickSize; }
             if (bar < 2) return;
 
             if (BlockInsideBars && h1 <= h2 && l1 >= l2)
             {
-                Draw.TextFixed(this, "SmartOrderError", $"ERROR: Inside Bar detected!\nTrade blocked. Press Cancel to hide.", TextPosition.Center, Brushes.Red, new NinjaTrader.Gui.Tools.SimpleFont("Arial", 14) { Bold = true }, Brushes.Transparent, Brushes.Transparent, 0);
-                Print($"[{DateTime.Now.ToString("HH:mm:ss.fff")}] MOMENTUM REJECTED (SHORT): Inside Bar detected.");
+                Draw.TextFixed(this, "SmartOrderError", "ERROR: Inside Bar blocked!", TextPosition.Center, Brushes.Red, new NinjaTrader.Gui.Tools.SimpleFont("Arial", 14) { Bold = true }, Brushes.Transparent, Brushes.Transparent, 0);
                 return;
             }
 
@@ -393,115 +460,216 @@ namespace NinjaTrader.NinjaScript.Strategies
             if (riskTicks > MaxRiskTicks)
             {
                 intendedStop = entryPrice + (MaxRiskTicks * tSize);
-                Print($"[{DateTime.Now.ToString("HH:mm:ss.fff")}] WARNING: Structural risk ({riskTicks} ticks) exceeds max. SL capped at {MaxRiskTicks} ticks.");
             }
 
             string atmId = GetAtmStrategyUniqueId();
             string uniqueOrderId = "MomShort_" + atmId; 
             string selectedAtm = availableAtms[currentAtmIndex];
             
-            lock(listLock) { trackedAtms[atmId] = new AtmState { AtmId = atmId, EntryOrderId = uniqueOrderId, Direction = AtmDirection.Short, EntryPrice = 0, BeTriggered = false, IntendedStopPrice = intendedStop, Stop1Adjusted = false, RunnerStopAdjusted = false, DisplayNotified = false }; }
+            lock(listLock) 
+            { 
+                trackedAtms[atmId] = new AtmState 
+                { 
+                    AtmId = atmId, 
+                    EntryOrderId = uniqueOrderId, 
+                    Direction = AtmDirection.Short, 
+                    EntryPrice = 0, 
+                    BeTriggered = false, 
+                    IntendedStopPrice = intendedStop, 
+                    TriggerPrice = entryPrice, 
+                    SetupBarIndex = bar, 
+                    Stop1Adjusted = false, 
+                    RunnerStopAdjusted = false, 
+                    DisplayNotified = false 
+                }; 
+            }
             
             if(c0 <= entryPrice) AtmStrategyCreate(OrderAction.Sell, OrderType.Limit, limitPrice, 0, TimeInForce.Gtc, uniqueOrderId, selectedAtm, atmId, (errorCode, errorId) => { });
             else AtmStrategyCreate(OrderAction.Sell, OrderType.StopLimit, limitPrice, entryPrice, TimeInForce.Gtc, uniqueOrderId, selectedAtm, atmId, (errorCode, errorId) => { });
-            
-            Print($"[{DateTime.Now.ToString("HH:mm:ss.fff")}] MOMENTUM EXECUTION ({selectedAtm}): SHORT placed at {entryPrice} (Max Limit: {limitPrice}).");
         }
 
-private void ExecuteSmartLong()
+        private void ExecuteSmartLong()
         {
-            double h1, l1, h2, l2, c0, tSize; int bar;
-            lock(dataLock) { h1 = cHigh1; l1 = cLow1; h2 = cHigh2; l2 = cLow2; c0 = cClose0; bar = cBar; tSize = cTickSize; }
+            double h1, l1, h2, l2, c0, open1, close1, tSize; int bar;
+            lock(dataLock) { h1 = cHigh1; l1 = cLow1; h2 = cHigh2; l2 = cLow2; open1 = cOpen1; c0 = cClose0; close1 = cClose1; bar = cBar; tSize = cTickSize; }
             if (bar < 2) return;
             
             if (BlockInsideBars && h1 <= h2 && l1 >= l2)
             {
-                Draw.TextFixed(this, "SmartOrderError", $"ERROR: Inside Bar detected!\nTrade blocked. Press Cancel to hide.", TextPosition.Center, Brushes.Red, new NinjaTrader.Gui.Tools.SimpleFont("Arial", 14) { Bold = true }, Brushes.Transparent, Brushes.Transparent, 0);
-                Print($"[{DateTime.Now.ToString("HH:mm:ss.fff")}] SMART REJECTED (LONG): Inside Bar detected.");
+                Draw.TextFixed(this, "SmartOrderError", "ERROR: Inside Bar blocked!", TextPosition.Center, Brushes.Red, new NinjaTrader.Gui.Tools.SimpleFont("Arial", 14) { Bold = true }, Brushes.Transparent, Brushes.Transparent, 0);
                 return;
             }
 
-            double structuralStop = l1 - tSize;
+            double structuralStop = Math.Min(l1, l2) - tSize;
             double triggerPrice = h1 + tSize;
             double structuralRiskTicks = Math.Round((triggerPrice - structuralStop) / tSize);
-            double candleSize = Math.Round((h1 - l1) / tSize);
+            double totalStructureSize = Math.Round((h1 - Math.Min(l1, l2)) / tSize); 
+
+            // --- MACK-WEICHE ---
+            string selectedAtm = availableAtms[currentAtmIndex];
+            if (selectedAtm.ToUpper().Contains("MACK"))
+            {
+                double stopLimitPrice = triggerPrice + tSize; 
+                string atmId = GetAtmStrategyUniqueId();
+                string uniqueOrderId = "SmartMackLong_" + atmId;
+                
+                lock(listLock) 
+                { 
+                    trackedAtms[atmId] = new AtmState 
+                    { 
+                        AtmId = atmId, 
+                        EntryOrderId = uniqueOrderId, 
+                        Direction = AtmDirection.Long, 
+                        EntryPrice = 0, 
+                        BeTriggered = false, 
+                        IntendedStopPrice = structuralStop, 
+                        TriggerPrice = triggerPrice, 
+                        SetupBarIndex = bar, 
+                        Stop1Adjusted = false, 
+                        RunnerStopAdjusted = false, 
+                        DisplayNotified = false 
+                    }; 
+                }
+                
+                AtmStrategyCreate(OrderAction.Buy, OrderType.StopLimit, stopLimitPrice, triggerPrice, TimeInForce.Gtc, uniqueOrderId, selectedAtm, atmId, (errorCode, errorId) => { });
+                RemoveDrawObject("SmartOrderError");
+                Print($"[{DateTime.Now.ToString("HH:mm:ss.fff")}] MACK Long Stop-Limit Armed. Trigger: {triggerPrice}, Limit: {stopLimitPrice}, SL: {structuralStop}");
+                return; 
+            }
+
+            if (!EnableTradingNonPerfectBars && close1 < ((h1 + l1) / 2)) {
+                Draw.TextFixed(this, "SmartOrderError", "ERROR: Bar did not close in the upper half!", TextPosition.Center, Brushes.Red, new NinjaTrader.Gui.Tools.SimpleFont("Arial", 14) { Bold = true }, Brushes.Transparent, Brushes.Transparent, 0);
+                return;
+            }
+
+            if (!EnableTradingNonPerfectBars && close1 < open1) {
+                Draw.TextFixed(this, "SmartOrderError", "ERROR: You are trying to go long on a red bar?", TextPosition.Center, Brushes.Red, new NinjaTrader.Gui.Tools.SimpleFont("Arial", 14) { Bold = true }, Brushes.Transparent, Brushes.Transparent, 0);
+                return;
+            }
             
-            if (structuralRiskTicks > MaxRiskTicks)
+            trapTriggerPrice = triggerPrice;
+            trapStopLossPrice = structuralStop; 
+            
+            // Wir prüfen gegen das eingestellte Risiko PLUS unsere neue Toleranz
+            if (structuralRiskTicks > (MaxRiskTicks + RiskToleranceTicks))
             {
                 double requiredPullbackTicks = structuralRiskTicks - MaxRiskTicks;
-                double maxPullbackTicks = Math.Floor(candleSize * (MaxPullbackPercent / 100.0));
+                double maxPullbackTicks = Math.Floor(totalStructureSize * (MaxPullbackPercent / 100.0));
 
                 if (requiredPullbackTicks > maxPullbackTicks)
                 {
-                    Draw.TextFixed(this, "SmartOrderError", $"ERROR: Signal bar too large ({candleSize} ticks)!\nRequired pullback ({requiredPullbackTicks} ticks) exceeds max allowed ({maxPullbackTicks} ticks).\nTrade blocked.", TextPosition.Center, Brushes.Red, new NinjaTrader.Gui.Tools.SimpleFont("Arial", 14) { Bold = true }, Brushes.Transparent, Brushes.Transparent, 0);
+                    Draw.TextFixed(this, "SmartOrderError", $"ERROR: Double bar structure too large!\nRequired risk pullback ({requiredPullbackTicks} ticks) exceeds max allowed limit ({maxPullbackTicks} ticks).", TextPosition.Center, Brushes.Red, new NinjaTrader.Gui.Tools.SimpleFont("Arial", 12) { Bold = true }, Brushes.Transparent, Brushes.Transparent, 0);
                     return;
                 }
 
-                trapTriggerPrice = triggerPrice;
-                // Dynamically place limit to respect exact MaxRiskTicks
                 trapLimitPrice = structuralStop + (MaxRiskTicks * tSize); 
-                trapStopLossPrice = structuralStop; // Keep the safe structural stop
-
-                trapBarNumber = bar;
-                trapAtmTemplateLong = availableAtms[currentAtmIndex]; 
-                trapLongActive = true;
-                trapShortActive = false; 
-                
-                Draw.HorizontalLine(this, "TrapTrigger", trapTriggerPrice, Brushes.Orange, DashStyleHelper.Dash, 2);
-                Draw.HorizontalLine(this, "TrapLimit", trapLimitPrice, Brushes.DodgerBlue, DashStyleHelper.Solid, 2);
-                RemoveDrawObject("SmartOrderError");
-                
-                Print($"[{DateTime.Now.ToString("HH:mm:ss.fff")}] SMART TRAP SET (LONG). Limit: {trapLimitPrice}, SL: {trapStopLossPrice}. Risk: {MaxRiskTicks} ticks.");
             }
-            else { ExecuteMomentumLong(); }
+            else 
+            {
+                trapLimitPrice = triggerPrice; 
+                Print($"[{DateTime.Now.ToString("HH:mm:ss.fff")}] Smart Long: Risk OK. Direct trigger entry.");
+            }
+            trapBarNumber = bar;
+            trapAtmTemplateLong = availableAtms[currentAtmIndex]; 
+            trapLongActive = true;
+            trapShortActive = false; 
+            
+            Draw.HorizontalLine(this, "TrapTrigger", trapTriggerPrice, Brushes.Orange, DashStyleHelper.Dash, 2);
+            Draw.HorizontalLine(this, "TrapLimit", trapLimitPrice, Brushes.DodgerBlue, DashStyleHelper.Solid, 2);
+            RemoveDrawObject("SmartOrderError");
+            Print($"[{DateTime.Now.ToString("HH:mm:ss.fff")}] Smart Long Trap Armed. Limit: {trapLimitPrice}, SL: {trapStopLossPrice}");
         }
 
         private void ExecuteSmartShort()
         {
-            double h1, l1, h2, l2, c0, tSize; int bar;
-            lock(dataLock) { h1 = cHigh1; l1 = cLow1; h2 = cHigh2; l2 = cLow2; c0 = cClose0; bar = cBar; tSize = cTickSize; }
+            double h1, l1, h2, l2, c0, open1, close1, tSize; int bar;
+            lock(dataLock) { h1 = cHigh1; l1 = cLow1; h2 = cHigh2; l2 = cLow2; open1 = cOpen1; c0 = cClose0; close1 = cClose1; bar = cBar; tSize = cTickSize; }
             if (bar < 2) return;
             
             if (BlockInsideBars && h1 <= h2 && l1 >= l2)
             {
-                Draw.TextFixed(this, "SmartOrderError", $"ERROR: Inside Bar detected!\nTrade blocked. Press Cancel to hide.", TextPosition.Center, Brushes.Red, new NinjaTrader.Gui.Tools.SimpleFont("Arial", 14) { Bold = true }, Brushes.Transparent, Brushes.Transparent, 0);
-                Print($"[{DateTime.Now.ToString("HH:mm:ss.fff")}] SMART REJECTED (SHORT): Inside Bar detected.");
+                Draw.TextFixed(this, "SmartOrderError", "ERROR: Inside Bar blocked!", TextPosition.Center, Brushes.Red, new NinjaTrader.Gui.Tools.SimpleFont("Arial", 14) { Bold = true }, Brushes.Transparent, Brushes.Transparent, 0);
                 return;
             }
 
-            double structuralStop = h1 + tSize;
+            double structuralStop = Math.Max(h1, h2) + tSize;
             double triggerPrice = l1 - tSize;
             double structuralRiskTicks = Math.Round((structuralStop - triggerPrice) / tSize);
-            double candleSize = Math.Round((h1 - l1) / tSize);
+            double totalStructureSize = Math.Round((Math.Max(h1, h2) - l1) / tSize); 
+
+            // --- MACK-WEICHE ---
+            string selectedAtm = availableAtms[currentAtmIndex];
+            if (selectedAtm.ToUpper().Contains("MACK"))
+            {
+                double stopLimitPrice = triggerPrice - tSize; 
+                string atmId = GetAtmStrategyUniqueId();
+                string uniqueOrderId = "SmartMackShort_" + atmId;
+                
+                lock(listLock) 
+                { 
+                    trackedAtms[atmId] = new AtmState 
+                    { 
+                        AtmId = atmId, 
+                        EntryOrderId = uniqueOrderId, 
+                        Direction = AtmDirection.Short, 
+                        EntryPrice = 0, 
+                        BeTriggered = false, 
+                        IntendedStopPrice = structuralStop, 
+                        TriggerPrice = triggerPrice, 
+                        SetupBarIndex = bar, 
+                        Stop1Adjusted = false, 
+                        RunnerStopAdjusted = false, 
+                        DisplayNotified = false 
+                    }; 
+                }
+                
+                AtmStrategyCreate(OrderAction.Sell, OrderType.StopLimit, stopLimitPrice, triggerPrice, TimeInForce.Gtc, uniqueOrderId, selectedAtm, atmId, (errorCode, errorId) => { });
+                RemoveDrawObject("SmartOrderError");
+                Print($"[{DateTime.Now.ToString("HH:mm:ss.fff")}] MACK Short Stop-Limit Armed. Trigger: {triggerPrice}, Limit: {stopLimitPrice}, SL: {structuralStop}");
+                return; 
+            }
+
+            if (!EnableTradingNonPerfectBars && close1 > ((h1 + l1) / 2) ) {
+                Draw.TextFixed(this, "SmartOrderError", "ERROR: Bar did not close in the lower half!", TextPosition.Center, Brushes.Red, new NinjaTrader.Gui.Tools.SimpleFont("Arial", 14) { Bold = true }, Brushes.Transparent, Brushes.Transparent, 0);
+                return;
+            }
+            if (!EnableTradingNonPerfectBars && close1 > open1) {
+                Draw.TextFixed(this, "SmartOrderError", "ERROR: You are trying to go short on a green bar?", TextPosition.Center, Brushes.Red, new NinjaTrader.Gui.Tools.SimpleFont("Arial", 14) { Bold = true }, Brushes.Transparent, Brushes.Transparent, 0);
+                return;
+            }
             
-            if (structuralRiskTicks > MaxRiskTicks)
+            trapTriggerPrice = triggerPrice;
+            trapStopLossPrice = structuralStop; 
+            
+            // Wir prüfen gegen das eingestellte Risiko PLUS unsere neue Toleranz
+            if (structuralRiskTicks > (MaxRiskTicks + RiskToleranceTicks))
             {
                 double requiredPullbackTicks = structuralRiskTicks - MaxRiskTicks;
-                double maxPullbackTicks = Math.Floor(candleSize * (MaxPullbackPercent / 100.0));
+                double maxPullbackTicks = Math.Floor(totalStructureSize * (MaxPullbackPercent / 100.0));
 
                 if (requiredPullbackTicks > maxPullbackTicks)
                 {
-                    Draw.TextFixed(this, "SmartOrderError", $"ERROR: Signal bar too large ({candleSize} ticks)!\nRequired pullback ({requiredPullbackTicks} ticks) exceeds max allowed ({maxPullbackTicks} ticks).\nTrade blocked.", TextPosition.Center, Brushes.Red, new NinjaTrader.Gui.Tools.SimpleFont("Arial", 14) { Bold = true }, Brushes.Transparent, Brushes.Transparent, 0);
+                    Draw.TextFixed(this, "SmartOrderError", $"ERROR: Double bar structure too large!\nRequired risk pullback ({requiredPullbackTicks} ticks) exceeds max allowed limit ({maxPullbackTicks} ticks).", TextPosition.Center, Brushes.Red, new NinjaTrader.Gui.Tools.SimpleFont("Arial", 12) { Bold = true }, Brushes.Transparent, Brushes.Transparent, 0);
                     return;
                 }
 
-                trapTriggerPrice = triggerPrice;
-                // Dynamically place limit to respect exact MaxRiskTicks
                 trapLimitPrice = structuralStop - (MaxRiskTicks * tSize); 
-                trapStopLossPrice = structuralStop; // Keep the safe structural stop
-
-                trapBarNumber = bar;
-                trapAtmTemplateShort = availableAtms[currentAtmIndex]; 
-                trapShortActive = true;
-                trapLongActive = false; 
-                
-                Draw.HorizontalLine(this, "TrapTrigger", trapTriggerPrice, Brushes.Orange, DashStyleHelper.Dash, 2);
-                Draw.HorizontalLine(this, "TrapLimit", trapLimitPrice, Brushes.DodgerBlue, DashStyleHelper.Solid, 2);
-                RemoveDrawObject("SmartOrderError");
-                
-                Print($"[{DateTime.Now.ToString("HH:mm:ss.fff")}] SMART TRAP SET (SHORT). Limit: {trapLimitPrice}, SL: {trapStopLossPrice}. Risk: {MaxRiskTicks} ticks.");
             }
-            else { ExecuteMomentumShort(); }
+            else 
+            {
+                trapLimitPrice = triggerPrice; 
+                Print($"[{DateTime.Now.ToString("HH:mm:ss.fff")}] Smart Short: Risk OK. Direct trigger entry.");
+            }
+
+            trapBarNumber = bar;
+            trapAtmTemplateShort = availableAtms[currentAtmIndex]; 
+            trapShortActive = true;
+            trapLongActive = false; 
+            
+            Draw.HorizontalLine(this, "TrapTrigger", trapTriggerPrice, Brushes.Orange, DashStyleHelper.Dash, 2);
+            Draw.HorizontalLine(this, "TrapLimit", trapLimitPrice, Brushes.DodgerBlue, DashStyleHelper.Solid, 2);
+            RemoveDrawObject("SmartOrderError");
+            Print($"[{DateTime.Now.ToString("HH:mm:ss.fff")}] Smart Short Trap Armed. Limit: {trapLimitPrice}, SL: {trapStopLossPrice}");
         }
 
         private void ExecuteDeepSmartLong()
@@ -512,8 +680,7 @@ private void ExecuteSmartLong()
             
             if (BlockInsideBars && h1 <= h2 && l1 >= l2)
             {
-                Draw.TextFixed(this, "SmartOrderError", $"ERROR: Inside Bar detected!\nTrade blocked. Press Cancel to hide.", TextPosition.Center, Brushes.Red, new NinjaTrader.Gui.Tools.SimpleFont("Arial", 14) { Bold = true }, Brushes.Transparent, Brushes.Transparent, 0);
-                Print($"[{DateTime.Now.ToString("HH:mm:ss.fff")}] DEEP SMART REJECTED (LONG): Inside Bar detected.");
+                Draw.TextFixed(this, "SmartOrderError", "ERROR: Inside Bar blocked!", TextPosition.Center, Brushes.Red, new NinjaTrader.Gui.Tools.SimpleFont("Arial", 14) { Bold = true }, Brushes.Transparent, Brushes.Transparent, 0);
                 return;
             }
 
@@ -523,22 +690,21 @@ private void ExecuteSmartLong()
 
             double maxPullbackTicks = Math.Floor(candleSize * (MaxPullbackPercent / 100.0));
             double limitPrice = h1 - (maxPullbackTicks * tSize); 
-            double actualRiskTicks = Math.Round((limitPrice - structuralStop) / tSize);
+            double deepRiskTicks = Math.Round((limitPrice - structuralStop) / tSize);
 
             trapTriggerPrice = triggerPrice;
-            trapLimitPrice = limitPrice;
 
-            if (actualRiskTicks > MaxRiskTicks)
+            if (deepRiskTicks > MaxRiskTicks)
             {
-                // Cap the stop loss distance automatically from the deep limit order
-                trapStopLossPrice = limitPrice - (MaxRiskTicks * tSize);
-                Print($"[{DateTime.Now.ToString("HH:mm:ss.fff")}] WARNING: Deep pullback risk ({actualRiskTicks}) > Max. SL capped at {MaxRiskTicks} ticks.");
+                trapLimitPrice = structuralStop + (MaxRiskTicks * tSize);
+                Print($"[{DateTime.Now.ToString("HH:mm:ss.fff")}] Deep Long pulled deeper to meet strict Max Risk requirements.");
             }
             else
             {
-                trapStopLossPrice = structuralStop;
+                trapLimitPrice = limitPrice;
             }
 
+            trapStopLossPrice = structuralStop;
             trapBarNumber = bar;
             trapAtmTemplateLong = availableAtms[currentAtmIndex]; 
             trapLongActive = true;
@@ -547,8 +713,6 @@ private void ExecuteSmartLong()
             Draw.HorizontalLine(this, "TrapTrigger", trapTriggerPrice, Brushes.Orange, DashStyleHelper.Dash, 2);
             Draw.HorizontalLine(this, "TrapLimit", trapLimitPrice, Brushes.DarkCyan, DashStyleHelper.Solid, 2);
             RemoveDrawObject("SmartOrderError");
-            
-            Print($"[{DateTime.Now.ToString("HH:mm:ss.fff")}] DEEP SMART TRAP SET (LONG). Limit: {trapLimitPrice}, SL: {trapStopLossPrice}");
         }
 
         private void ExecuteDeepSmartShort()
@@ -559,8 +723,7 @@ private void ExecuteSmartLong()
             
             if (BlockInsideBars && h1 <= h2 && l1 >= l2)
             {
-                Draw.TextFixed(this, "SmartOrderError", $"ERROR: Inside Bar detected!\nTrade blocked. Press Cancel to hide.", TextPosition.Center, Brushes.Red, new NinjaTrader.Gui.Tools.SimpleFont("Arial", 14) { Bold = true }, Brushes.Transparent, Brushes.Transparent, 0);
-                Print($"[{DateTime.Now.ToString("HH:mm:ss.fff")}] DEEP SMART REJECTED (SHORT): Inside Bar detected.");
+                Draw.TextFixed(this, "SmartOrderError", "ERROR: Inside Bar blocked!", TextPosition.Center, Brushes.Red, new NinjaTrader.Gui.Tools.SimpleFont("Arial", 14) { Bold = true }, Brushes.Transparent, Brushes.Transparent, 0);
                 return;
             }
 
@@ -570,22 +733,21 @@ private void ExecuteSmartLong()
 
             double maxPullbackTicks = Math.Floor(candleSize * (MaxPullbackPercent / 100.0));
             double limitPrice = l1 + (maxPullbackTicks * tSize); 
-            double actualRiskTicks = Math.Round((structuralStop - limitPrice) / tSize);
+            double deepRiskTicks = Math.Round((structuralStop - limitPrice) / tSize);
 
             trapTriggerPrice = triggerPrice;
-            trapLimitPrice = limitPrice;
 
-            if (actualRiskTicks > MaxRiskTicks)
+            if (deepRiskTicks > MaxRiskTicks)
             {
-                // Cap the stop loss distance automatically from the deep limit order
-                trapStopLossPrice = limitPrice + (MaxRiskTicks * tSize);
-                Print($"[{DateTime.Now.ToString("HH:mm:ss.fff")}] WARNING: Deep pullback risk ({actualRiskTicks}) > Max. SL capped at {MaxRiskTicks} ticks.");
+                trapLimitPrice = structuralStop - (MaxRiskTicks * tSize);
+                Print($"[{DateTime.Now.ToString("HH:mm:ss.fff")}] Deep Short pulled deeper to meet strict Max Risk requirements.");
             }
             else
             {
-                trapStopLossPrice = structuralStop;
+                trapLimitPrice = limitPrice;
             }
 
+            trapStopLossPrice = structuralStop;
             trapBarNumber = bar;
             trapAtmTemplateShort = availableAtms[currentAtmIndex]; 
             trapLongActive = false;
@@ -594,8 +756,6 @@ private void ExecuteSmartLong()
             Draw.HorizontalLine(this, "TrapTrigger", trapTriggerPrice, Brushes.Orange, DashStyleHelper.Dash, 2);
             Draw.HorizontalLine(this, "TrapLimit", trapLimitPrice, Brushes.DarkCyan, DashStyleHelper.Solid, 2);
             RemoveDrawObject("SmartOrderError");
-            
-            Print($"[{DateTime.Now.ToString("HH:mm:ss.fff")}] DEEP SMART TRAP SET (SHORT). Limit: {trapLimitPrice}, SL: {trapStopLossPrice}");
         }
 
         protected override void OnBarUpdate()
@@ -608,6 +768,8 @@ private void ExecuteSmartLong()
                 cLow2 = Low[2];
                 cHigh1 = High[1];
                 cLow1 = Low[1];
+                cClose1 = Close[1];
+                cOpen1 = Open[1]; 
                 cClose0 = Close[0];
                 cBar = CurrentBar;
                 cTickSize = TickSize;
@@ -623,8 +785,7 @@ private void ExecuteSmartLong()
                 string atmId = GetAtmStrategyUniqueId();
                 string uniqueOrderId = "TrapLong_" + atmId;
                 
-                lock(listLock) { trackedAtms[atmId] = new AtmState { AtmId = atmId, EntryOrderId = uniqueOrderId, Direction = AtmDirection.Long, EntryPrice = 0, BeTriggered = false, IntendedStopPrice = trapStopLossPrice, Stop1Adjusted = false, RunnerStopAdjusted = false, DisplayNotified = false }; }
-                
+                lock(listLock) { trackedAtms[atmId] = new AtmState { AtmId = atmId, EntryOrderId = uniqueOrderId, Direction = AtmDirection.Long, EntryPrice = 0, BeTriggered = false, IntendedStopPrice = trapStopLossPrice, TriggerPrice = trapTriggerPrice, SetupBarIndex = cBar, Stop1Adjusted = false, RunnerStopAdjusted = false, DisplayNotified = false }; }
                 AtmStrategyCreate(OrderAction.Buy, OrderType.Limit, trapLimitPrice, 0, TimeInForce.Gtc, uniqueOrderId, trapAtmTemplateLong, atmId, (errorCode, errorId) => { });
             }
 
@@ -635,8 +796,7 @@ private void ExecuteSmartLong()
                 string atmId = GetAtmStrategyUniqueId();
                 string uniqueOrderId = "TrapShort_" + atmId;
                 
-                lock(listLock) { trackedAtms[atmId] = new AtmState { AtmId = atmId, EntryOrderId = uniqueOrderId, Direction = AtmDirection.Short, EntryPrice = 0, BeTriggered = false, IntendedStopPrice = trapStopLossPrice, Stop1Adjusted = false, RunnerStopAdjusted = false, DisplayNotified = false }; }
-                
+                lock(listLock) { trackedAtms[atmId] = new AtmState { AtmId = atmId, EntryOrderId = uniqueOrderId, Direction = AtmDirection.Short, EntryPrice = 0, BeTriggered = false, IntendedStopPrice = trapStopLossPrice, TriggerPrice = trapTriggerPrice, SetupBarIndex = cBar, Stop1Adjusted = false, RunnerStopAdjusted = false, DisplayNotified = false }; }
                 AtmStrategyCreate(OrderAction.Sell, OrderType.Limit, trapLimitPrice, 0, TimeInForce.Gtc, uniqueOrderId, trapAtmTemplateShort, atmId, (errorCode, errorId) => { });
             }
 
@@ -651,6 +811,38 @@ private void ExecuteSmartLong()
                         
                         if (state.EntryPrice == 0)
                         {
+                            if (state.TriggerPrice > 0)
+                            {
+                                if (state.Direction == AtmDirection.Long && High[0] >= state.TriggerPrice + (MaxRunwayTicks * cTickSize))
+                                {
+                                    Print($"[{DateTime.Now.ToString("HH:mm:ss.fff")}] Smart Long EXPIRED: Price ran {MaxRunwayTicks} Ticks past trigger. Cancelling Limit Order.");
+                                    AtmStrategyCancelEntryOrder(state.AtmId);
+                                    AtmStrategyClose(state.AtmId);
+                                    deadAtms.Add(state.AtmId);
+                                    continue;
+                                }
+                                else if (state.Direction == AtmDirection.Short && Low[0] <= state.TriggerPrice - (MaxRunwayTicks * cTickSize))
+                                {
+                                    Print($"[{DateTime.Now.ToString("HH:mm:ss.fff")}] Smart Short EXPIRED: Price ran {MaxRunwayTicks} Ticks past trigger. Cancelling Limit Order.");
+                                    AtmStrategyCancelEntryOrder(state.AtmId);
+                                    AtmStrategyClose(state.AtmId);
+                                    deadAtms.Add(state.AtmId);
+                                    continue;
+                                }
+                            }
+
+                            // --- DYNAMISCHER BAR EXPIRATION CHECK ---
+                            int maxBarsToWait = state.EntryOrderId.ToLower().Contains("mack") ? 1 : BarsToWaitNonMack;
+                            if (cBar >= state.SetupBarIndex + maxBarsToWait)
+                            {
+                                Print($"[{DateTime.Now.ToString("HH:mm:ss.fff")}] Smart Order EXPIRED: Allowed bars exceeded (Current: {cBar}, Setup: {state.SetupBarIndex}, Allowed: {maxBarsToWait}). Cancelling Live Order.");
+                                AtmStrategyCancelEntryOrder(state.AtmId);
+                                AtmStrategyClose(state.AtmId);
+                                deadAtms.Add(state.AtmId);
+                                continue;
+                            }
+                            // --- ENDE DYNAMISCHER CHECK ---
+
                             string[] entryStatus = GetAtmStrategyEntryOrderStatus(state.EntryOrderId);
                             if (entryStatus != null && entryStatus.Length > 2)
                             {
@@ -699,7 +891,7 @@ private void ExecuteSmartLong()
                             if (state.Stop1Adjusted && !state.DisplayNotified)
                             {
                                 state.DisplayNotified = true;
-                                Draw.TextFixed(this, "SL_Notice", $"SMART STOP: Secured at {state.IntendedStopPrice}", TextPosition.BottomLeft, Brushes.Orange, new NinjaTrader.Gui.Tools.SimpleFont("Arial", 12) { Bold = true }, Brushes.Transparent, Brushes.Transparent, 0);
+                                Draw.TextFixed(this, "SL_Notice", $"STRUCTURAL SL: Secured at {state.IntendedStopPrice}", TextPosition.BottomLeft, Brushes.Orange, new NinjaTrader.Gui.Tools.SimpleFont("Arial", 12) { Bold = true }, Brushes.Transparent, Brushes.Transparent, 0);
                             }
                         }
 
@@ -727,10 +919,7 @@ private void ExecuteSmartLong()
                             }
                         }
 
-                        if (state.EntryPrice != 0 && GetAtmStrategyPositionQuantity(state.AtmId) == 0)
-                        {
-                            deadAtms.Add(state.AtmId);
-                        }
+                        if (state.EntryPrice != 0 && GetAtmStrategyPositionQuantity(state.AtmId) == 0) deadAtms.Add(state.AtmId);
                     }
                     
                     foreach(string id in deadAtms) 
