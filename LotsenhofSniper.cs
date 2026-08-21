@@ -39,9 +39,10 @@ namespace NinjaTrader.NinjaScript.Strategies
         public double IntendedStopPrice; 
         public double TriggerPrice;
         public int SetupBarIndex;
-        public bool Stop1Adjusted;        
+        public bool Stop1Adjusted;
         public bool RunnerStopAdjusted;
         public bool DisplayNotified;
+        public double ScratchTargetPrice;
     }
 
     public class LotsenhofSniper : Strategy
@@ -54,6 +55,7 @@ namespace NinjaTrader.NinjaScript.Strategies
         private Button deepSellButton;
         private Button momentumBuyButton;
         private Button momentumSellButton;
+        private Button scratchButton;
         private Button cancelButton;
         private Grid myGrid;
         
@@ -157,6 +159,15 @@ namespace NinjaTrader.NinjaScript.Strategies
         public string RunnerStopName { get; set; }
 
         [NinjaScriptProperty]
+        [Range(0, 50)]
+        [Display(Name="Scratch Offset (Ticks)", Description="Ticks beyond entry (in profit direction) the targets are pulled to when Scratch is pressed.", Order=1, GroupName="4. Scratch Exit")]
+        public int ScratchOffsetTicks { get; set; }
+
+        [NinjaScriptProperty]
+        [Display(Name="Runner Target Name", Description="Name of the runner target in ATM (Default: Target2). Silently ignored if the template has no such target.", Order=2, GroupName="4. Scratch Exit")]
+        public string RunnerTargetName { get; set; }
+
+        [NinjaScriptProperty]
         [Display(Name="Hotkey LONG (Smart)", Description="Key for Smart Long Entry", Order=1, GroupName="3. Hotkeys")]
         public SniperKey HotkeyLong { get; set; }
 
@@ -175,6 +186,10 @@ namespace NinjaTrader.NinjaScript.Strategies
         [NinjaScriptProperty]
         [Display(Name="Hotkey CANCEL", Description="Key to cancel all traps", Order=5, GroupName="3. Hotkeys")]
         public SniperKey HotkeyCancel { get; set; }
+
+        [NinjaScriptProperty]
+        [Display(Name="Hotkey SCRATCH", Description="Key to pull all targets to entry +/- Scratch Offset", Order=6, GroupName="3. Hotkeys")]
+        public SniperKey HotkeyScratch { get; set; }
 
         protected override void OnStateChange()
         {
@@ -202,12 +217,15 @@ namespace NinjaTrader.NinjaScript.Strategies
                 Stop1Name                   = "Stop1";
                 RunnerStopName              = "Stop2";
                 RiskToleranceTicks          = 2; // Standardmäßig 2 Ticks "Gummiband"
-                
-                HotkeyLong                  = SniperKey.W; 
+                ScratchOffsetTicks          = 2;
+                RunnerTargetName            = "Target2";
+
+                HotkeyLong                  = SniperKey.W;
                 HotkeyShort                 = SniperKey.S; 
                 HotkeyMomentumLong          = SniperKey.Ctrl_Up; 
                 HotkeyMomentumShort         = SniperKey.Ctrl_Down; 
-                HotkeyCancel                = SniperKey.X; 
+                HotkeyCancel                = SniperKey.X;
+                HotkeyScratch               = SniperKey.C;
             }
             else if (State == State.DataLoaded)
             {
@@ -249,6 +267,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 RemoveDrawObject("SmartOrderError");
                 RemoveDrawObject("BE_Notice");
                 RemoveDrawObject("SL_Notice");
+                RemoveDrawObject("Scratch_Notice");
                 lock(listLock) { trackedAtms.Clear(); }
             }
         }
@@ -262,7 +281,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 Margin = new Thickness(0, 30, 10, 0)
             };
 
-            for(int i=0; i<8; i++) myGrid.RowDefinitions.Add(new RowDefinition());
+            for(int i=0; i<9; i++) myGrid.RowDefinitions.Add(new RowDefinition());
 
             atmToggleButton = new Button 
             { 
@@ -315,9 +334,13 @@ namespace NinjaTrader.NinjaScript.Strategies
             momentumSellButton.Click += (o, e) => TriggerCustomEvent(state => ExecuteMomentumShort(), null);
             Grid.SetRow(momentumSellButton, 6);
 
+            scratchButton = new Button { Content = $"SCRATCH TP (+{ScratchOffsetTicks})", Foreground = Brushes.Black, Background = Brushes.Gold, FontWeight = FontWeights.Bold, Margin = new Thickness(2), Padding = new Thickness(10, 5, 10, 5) };
+            scratchButton.Click += (o, e) => TriggerCustomEvent(state => ExecuteScratch(), null);
+            Grid.SetRow(scratchButton, 7);
+
             cancelButton = new Button { Content = "CANCEL ALL", Foreground = Brushes.White, Background = Brushes.DarkOrange, FontWeight = FontWeights.Bold, Margin = new Thickness(2), Padding = new Thickness(10, 5, 10, 5) };
             cancelButton.Click += (o, e) => TriggerCustomEvent(state => ExecuteCancel(), null);
-            Grid.SetRow(cancelButton, 7);
+            Grid.SetRow(cancelButton, 8);
 
             myGrid.Children.Add(atmToggleButton);
             myGrid.Children.Add(buyButton);
@@ -328,6 +351,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 myGrid.Children.Add(momentumBuyButton);
                 myGrid.Children.Add(momentumSellButton);
             }
+            myGrid.Children.Add(scratchButton);
             myGrid.Children.Add(cancelButton);
             
             UserControlCollection.Add(myGrid);
@@ -361,6 +385,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             else if (IsHotkeyPressed(HotkeyMomentumLong, e)) { e.Handled = true; TriggerCustomEvent(state => ExecuteMomentumLong(), null); }
             else if (IsHotkeyPressed(HotkeyMomentumShort, e)) { e.Handled = true; TriggerCustomEvent(state => ExecuteMomentumShort(), null); }
             else if (IsHotkeyPressed(HotkeyCancel, e)) { e.Handled = true; TriggerCustomEvent(state => ExecuteCancel(), null); }
+            else if (IsHotkeyPressed(HotkeyScratch, e)) { e.Handled = true; TriggerCustomEvent(state => ExecuteScratch(), null); }
         }
 
         private void ExecuteCancel()
@@ -373,7 +398,8 @@ namespace NinjaTrader.NinjaScript.Strategies
             RemoveDrawObject("SmartOrderError");
             RemoveDrawObject("BE_Notice");
             RemoveDrawObject("SL_Notice");
-            
+            RemoveDrawObject("Scratch_Notice");
+
             lock(listLock)
             {
                 foreach (var kvp in trackedAtms)
@@ -384,6 +410,78 @@ namespace NinjaTrader.NinjaScript.Strategies
                 trackedAtms.Clear();
             }
             Print($"[{DateTime.Now.ToString("HH:mm:ss.fff")}] Killswitch activated. All traps and active orders destroyed.");
+        }
+
+        private void ExecuteScratch()
+        {
+            RemoveDrawObject("SmartOrderError");
+            RemoveDrawObject("Scratch_Notice");
+
+            double tSize;
+            lock(dataLock) { tSize = cTickSize; }
+            if (tSize <= 0) return;
+
+            int livePositions = 0;
+            int adjustedTargets = 0;
+
+            lock(listLock)
+            {
+                foreach (var kvp in trackedAtms)
+                {
+                    AtmState state = kvp.Value;
+
+                    if (state.EntryPrice == 0) continue;
+                    if (GetAtmStrategyPositionQuantity(state.AtmId) == 0) continue;
+                    livePositions++;
+
+                    double scratchPrice = state.Direction == AtmDirection.Long
+                        ? state.EntryPrice + (ScratchOffsetTicks * tSize)
+                        : state.EntryPrice - (ScratchOffsetTicks * tSize);
+
+                    // Wir ziehen nur nach innen: ein bereits engeres Ziel bleibt unangetastet.
+                    if (state.ScratchTargetPrice != 0)
+                    {
+                        bool isCloser = state.Direction == AtmDirection.Long
+                            ? scratchPrice < state.ScratchTargetPrice
+                            : scratchPrice > state.ScratchTargetPrice;
+                        if (!isCloser) continue;
+                    }
+
+                    if (PullTargetToScratch(Target1Name, state.AtmId, scratchPrice)) adjustedTargets++;
+                    if (PullTargetToScratch(RunnerTargetName, state.AtmId, scratchPrice)) adjustedTargets++;
+                    state.ScratchTargetPrice = scratchPrice;
+                }
+            }
+
+            if (livePositions == 0)
+            {
+                Draw.TextFixed(this, "SmartOrderError", "ERROR: No active position to scratch!", TextPosition.Center, Brushes.Red, new NinjaTrader.Gui.Tools.SimpleFont("Arial", 14) { Bold = true }, Brushes.Transparent, Brushes.Transparent, 0);
+                return;
+            }
+
+            if (adjustedTargets == 0)
+            {
+                Draw.TextFixed(this, "Scratch_Notice", $"SCRATCH: Targets already at or tighter than +{ScratchOffsetTicks} ticks.", TextPosition.TopLeft, Brushes.Gold, new NinjaTrader.Gui.Tools.SimpleFont("Arial", 12) { Bold = true }, Brushes.Transparent, Brushes.Transparent, 0);
+                Print($"[{DateTime.Now.ToString("HH:mm:ss.fff")}] Scratch skipped: {livePositions} position(s) already at or tighter than {ScratchOffsetTicks} ticks.");
+                return;
+            }
+
+            Draw.TextFixed(this, "Scratch_Notice", $"SCRATCH: {adjustedTargets} target(s) pulled to {ScratchOffsetTicks} ticks in profit", TextPosition.TopLeft, Brushes.Gold, new NinjaTrader.Gui.Tools.SimpleFont("Arial", 12) { Bold = true }, Brushes.Transparent, Brushes.Transparent, 0);
+            Print($"[{DateTime.Now.ToString("HH:mm:ss.fff")}] Scratch executed on {livePositions} position(s): {adjustedTargets} target(s) pulled to {ScratchOffsetTicks} ticks beyond entry.");
+        }
+
+        private bool PullTargetToScratch(string targetName, string atmId, double price)
+        {
+            if (string.IsNullOrWhiteSpace(targetName)) return false;
+
+            string[,] status = GetAtmStrategyStopTargetOrderStatus(targetName, atmId);
+            if (status == null || status.GetLength(0) == 0 || status.GetLength(1) <= 2) return false;
+
+            string orderState = status[0, 2];
+            if (orderState != "Accepted" && orderState != "Working") return false;
+
+            AtmStrategyChangeStopTarget(0, price, targetName, atmId);
+            return true;
         }
 
         private void ExecuteMomentumLong()
@@ -429,7 +527,8 @@ namespace NinjaTrader.NinjaScript.Strategies
                     SetupBarIndex = bar, 
                     Stop1Adjusted = false, 
                     RunnerStopAdjusted = false, 
-                    DisplayNotified = false 
+                    DisplayNotified = false,
+                    ScratchTargetPrice = 0
                 }; 
             }
             
@@ -480,7 +579,8 @@ namespace NinjaTrader.NinjaScript.Strategies
                     SetupBarIndex = bar, 
                     Stop1Adjusted = false, 
                     RunnerStopAdjusted = false, 
-                    DisplayNotified = false 
+                    DisplayNotified = false,
+                    ScratchTargetPrice = 0
                 }; 
             }
             
@@ -527,7 +627,8 @@ namespace NinjaTrader.NinjaScript.Strategies
                         SetupBarIndex = bar, 
                         Stop1Adjusted = false, 
                         RunnerStopAdjusted = false, 
-                        DisplayNotified = false 
+                        DisplayNotified = false,
+                        ScratchTargetPrice = 0
                     }; 
                 }
                 
@@ -619,7 +720,8 @@ namespace NinjaTrader.NinjaScript.Strategies
                         SetupBarIndex = bar, 
                         Stop1Adjusted = false, 
                         RunnerStopAdjusted = false, 
-                        DisplayNotified = false 
+                        DisplayNotified = false,
+                        ScratchTargetPrice = 0
                     }; 
                 }
                 
@@ -785,7 +887,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 string atmId = GetAtmStrategyUniqueId();
                 string uniqueOrderId = "TrapLong_" + atmId;
                 
-                lock(listLock) { trackedAtms[atmId] = new AtmState { AtmId = atmId, EntryOrderId = uniqueOrderId, Direction = AtmDirection.Long, EntryPrice = 0, BeTriggered = false, IntendedStopPrice = trapStopLossPrice, TriggerPrice = trapTriggerPrice, SetupBarIndex = cBar, Stop1Adjusted = false, RunnerStopAdjusted = false, DisplayNotified = false }; }
+                lock(listLock) { trackedAtms[atmId] = new AtmState { AtmId = atmId, EntryOrderId = uniqueOrderId, Direction = AtmDirection.Long, EntryPrice = 0, BeTriggered = false, IntendedStopPrice = trapStopLossPrice, TriggerPrice = trapTriggerPrice, SetupBarIndex = cBar, Stop1Adjusted = false, RunnerStopAdjusted = false, DisplayNotified = false, ScratchTargetPrice = 0 }; }
                 AtmStrategyCreate(OrderAction.Buy, OrderType.Limit, trapLimitPrice, 0, TimeInForce.Gtc, uniqueOrderId, trapAtmTemplateLong, atmId, (errorCode, errorId) => { });
             }
 
@@ -796,7 +898,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 string atmId = GetAtmStrategyUniqueId();
                 string uniqueOrderId = "TrapShort_" + atmId;
                 
-                lock(listLock) { trackedAtms[atmId] = new AtmState { AtmId = atmId, EntryOrderId = uniqueOrderId, Direction = AtmDirection.Short, EntryPrice = 0, BeTriggered = false, IntendedStopPrice = trapStopLossPrice, TriggerPrice = trapTriggerPrice, SetupBarIndex = cBar, Stop1Adjusted = false, RunnerStopAdjusted = false, DisplayNotified = false }; }
+                lock(listLock) { trackedAtms[atmId] = new AtmState { AtmId = atmId, EntryOrderId = uniqueOrderId, Direction = AtmDirection.Short, EntryPrice = 0, BeTriggered = false, IntendedStopPrice = trapStopLossPrice, TriggerPrice = trapTriggerPrice, SetupBarIndex = cBar, Stop1Adjusted = false, RunnerStopAdjusted = false, DisplayNotified = false, ScratchTargetPrice = 0 }; }
                 AtmStrategyCreate(OrderAction.Sell, OrderType.Limit, trapLimitPrice, 0, TimeInForce.Gtc, uniqueOrderId, trapAtmTemplateShort, atmId, (errorCode, errorId) => { });
             }
 
@@ -925,8 +1027,9 @@ namespace NinjaTrader.NinjaScript.Strategies
                     foreach(string id in deadAtms) 
                     {
                         trackedAtms.Remove(id);
-                        RemoveDrawObject("BE_Notice"); 
-                        RemoveDrawObject("SL_Notice"); 
+                        RemoveDrawObject("BE_Notice");
+                        RemoveDrawObject("SL_Notice");
+                        RemoveDrawObject("Scratch_Notice");
                     }
                 }
             }
