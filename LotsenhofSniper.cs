@@ -47,6 +47,7 @@ namespace NinjaTrader.NinjaScript.Strategies
         public bool PositionSeen;
         public bool EntryComplete;
         public bool EntryCancelRequested;
+        public bool HasRunner;
     }
 
     public class LotsenhofSniper : Strategy
@@ -59,6 +60,8 @@ namespace NinjaTrader.NinjaScript.Strategies
         private Button deepSellButton;
         private Button momentumBuyButton;
         private Button momentumSellButton;
+        private Button noRunnerBuyButton;
+        private Button noRunnerSellButton;
         private Button scratchButton;
         private Button cancelButton;
         private Grid myGrid;
@@ -72,6 +75,8 @@ namespace NinjaTrader.NinjaScript.Strategies
         // Trap State Variables
         private bool trapLongActive = false;
         private bool trapShortActive = false;
+        private bool trapNoRunnerLong = false;
+        private bool trapNoRunnerShort = false;
         private double trapTriggerPrice = 0.0;
         private double trapLimitPrice = 0.0;
         private double trapStopLossPrice = 0.0; 
@@ -133,6 +138,10 @@ namespace NinjaTrader.NinjaScript.Strategies
         [Range(1, 100)]
         [Display(Name="Cancel Partial Fill After (Ticks)", Description="Nach einem Teilfill: storniert die Restmenge der Entry-Order, sobald der Preis so viele Ticks in Profitrichtung vom Einstand weggelaufen ist.", Order=12, GroupName="1. Parameters")]
         public int PartialFillCancelTicks { get; set; }
+
+        [NinjaScriptProperty]
+        [Display(Name="No-Runner Template Suffix", Description="Wird an das aktuell gewaehlte ATM-Template angehaengt, wenn ein No-Runner-Button gedrueckt wird (z.B. WADE12 -> WADE12NR).", Order=13, GroupName="1. Parameters")]
+        public string NoRunnerSuffix { get; set; }
 
         [NinjaScriptProperty]
         [Display(Name="Show only Smart buttons", Description="If true, only smart long/short entry buttons are showed.", Order=10, GroupName="1. Parameters")]
@@ -241,6 +250,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 AutoBreakevenOffset         = 0;
                 BarsToWait                  = 3; // Pending limit orders stay alive for 3 bars
                 PartialFillCancelTicks      = 10;
+                NoRunnerSuffix              = "NR";
                 ShowOnlySmartButtons        = true;
                 Target1Name                 = "Target1";
                 Stop1Name                   = "Stop1";
@@ -317,6 +327,8 @@ namespace NinjaTrader.NinjaScript.Strategies
             };
 
             for(int i=0; i<9; i++) myGrid.RowDefinitions.Add(new RowDefinition());
+            // Spalte 0 = Standard-ATM (mit Runner), Spalte 1 = No-Runner-Variante.
+            for(int i=0; i<2; i++) myGrid.ColumnDefinitions.Add(new ColumnDefinition());
 
             atmToggleButton = new Button 
             { 
@@ -344,42 +356,63 @@ namespace NinjaTrader.NinjaScript.Strategies
                 });
             };
             Grid.SetRow(atmToggleButton, 0);
+            Grid.SetColumnSpan(atmToggleButton, 2);
 
             buyButton = new Button { Content = "LONG (Smart)", Foreground = Brushes.White, Background = Brushes.DarkGreen, FontWeight = FontWeights.Bold, Margin = new Thickness(2), Padding = new Thickness(10, 5, 10, 5) };
             buyButton.Click += (o, e) => TriggerCustomEvent(state => ExecuteSmartLong(), null);
             Grid.SetRow(buyButton, 1);
+            Grid.SetColumn(buyButton, 0);
 
             sellButton = new Button { Content = "SHORT (Smart)", Foreground = Brushes.White, Background = Brushes.DarkRed, FontWeight = FontWeights.Bold, Margin = new Thickness(2), Padding = new Thickness(10, 5, 10, 5) };
             sellButton.Click += (o, e) => TriggerCustomEvent(state => ExecuteSmartShort(), null);
             Grid.SetRow(sellButton, 2);
+            Grid.SetColumn(sellButton, 0);
+
+            noRunnerBuyButton = new Button { Content = "LONG (No Runner)", Foreground = Brushes.White, Background = Brushes.ForestGreen, FontWeight = FontWeights.Bold, Margin = new Thickness(2), Padding = new Thickness(10, 5, 10, 5) };
+            noRunnerBuyButton.Click += (o, e) => TriggerCustomEvent(state => ExecuteSmartLong(true), null);
+            Grid.SetRow(noRunnerBuyButton, 1);
+            Grid.SetColumn(noRunnerBuyButton, 1);
+
+            noRunnerSellButton = new Button { Content = "SHORT (No Runner)", Foreground = Brushes.White, Background = Brushes.Firebrick, FontWeight = FontWeights.Bold, Margin = new Thickness(2), Padding = new Thickness(10, 5, 10, 5) };
+            noRunnerSellButton.Click += (o, e) => TriggerCustomEvent(state => ExecuteSmartShort(true), null);
+            Grid.SetRow(noRunnerSellButton, 2);
+            Grid.SetColumn(noRunnerSellButton, 1);
 
             deepBuyButton = new Button { Content = "DEEP LONG (Max PB)", Foreground = Brushes.White, Background = Brushes.SeaGreen, FontWeight = FontWeights.Bold, Margin = new Thickness(2), Padding = new Thickness(10, 5, 10, 5) };
             deepBuyButton.Click += (o, e) => TriggerCustomEvent(state => ExecuteDeepSmartLong(), null);
             Grid.SetRow(deepBuyButton, 3);
+            Grid.SetColumnSpan(deepBuyButton, 2);
 
             deepSellButton = new Button { Content = "DEEP SHORT (Max PB)", Foreground = Brushes.White, Background = Brushes.Firebrick, FontWeight = FontWeights.Bold, Margin = new Thickness(2), Padding = new Thickness(10, 5, 10, 5) };
             deepSellButton.Click += (o, e) => TriggerCustomEvent(state => ExecuteDeepSmartShort(), null);
             Grid.SetRow(deepSellButton, 4);
+            Grid.SetColumnSpan(deepSellButton, 2);
 
             momentumBuyButton = new Button { Content = "MOMENTUM LONG", Foreground = Brushes.White, Background = Brushes.MediumSeaGreen, FontWeight = FontWeights.Bold, Margin = new Thickness(2), Padding = new Thickness(10, 5, 10, 5) };
             momentumBuyButton.Click += (o, e) => TriggerCustomEvent(state => ExecuteMomentumLong(), null);
             Grid.SetRow(momentumBuyButton, 5);
+            Grid.SetColumnSpan(momentumBuyButton, 2);
 
             momentumSellButton = new Button { Content = "MOMENTUM SHORT", Foreground = Brushes.White, Background = Brushes.IndianRed, FontWeight = FontWeights.Bold, Margin = new Thickness(2), Padding = new Thickness(10, 5, 10, 5) };
             momentumSellButton.Click += (o, e) => TriggerCustomEvent(state => ExecuteMomentumShort(), null);
             Grid.SetRow(momentumSellButton, 6);
+            Grid.SetColumnSpan(momentumSellButton, 2);
 
             scratchButton = new Button { Content = $"SCRATCH TP (+{ScratchOffsetTicks})", Foreground = Brushes.Black, Background = Brushes.Gold, FontWeight = FontWeights.Bold, Margin = new Thickness(2), Padding = new Thickness(10, 5, 10, 5) };
             scratchButton.Click += (o, e) => TriggerCustomEvent(state => ExecuteScratch(), null);
             Grid.SetRow(scratchButton, 7);
+            Grid.SetColumnSpan(scratchButton, 2);
 
             cancelButton = new Button { Content = "CANCEL ALL", Foreground = Brushes.White, Background = Brushes.DarkOrange, FontWeight = FontWeights.Bold, Margin = new Thickness(2), Padding = new Thickness(10, 5, 10, 5) };
             cancelButton.Click += (o, e) => TriggerCustomEvent(state => ExecuteCancel(), null);
             Grid.SetRow(cancelButton, 8);
+            Grid.SetColumnSpan(cancelButton, 2);
 
             myGrid.Children.Add(atmToggleButton);
             myGrid.Children.Add(buyButton);
             myGrid.Children.Add(sellButton);
+            myGrid.Children.Add(noRunnerBuyButton);
+            myGrid.Children.Add(noRunnerSellButton);
             if (!ShowOnlySmartButtons){
                 myGrid.Children.Add(deepBuyButton);
                 myGrid.Children.Add(deepSellButton);
@@ -487,7 +520,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                     }
 
                     if (PullTargetToScratch(Target1Name, state.AtmId, scratchPrice)) adjustedTargets++;
-                    if (state.EntryComplete && PullTargetToScratch(RunnerTargetName, state.AtmId, scratchPrice)) adjustedTargets++;
+                    if (state.HasRunner && state.EntryComplete && PullTargetToScratch(RunnerTargetName, state.AtmId, scratchPrice)) adjustedTargets++;
                     state.ScratchTargetPrice = scratchPrice;
                 }
             }
@@ -570,7 +603,8 @@ namespace NinjaTrader.NinjaScript.Strategies
                     Stop1Adjusted = false, 
                     RunnerStopAdjusted = false, 
                     DisplayNotified = false,
-                    ScratchTargetPrice = 0
+                    ScratchTargetPrice = 0,
+                    HasRunner = true
                 }; 
             }
             
@@ -622,7 +656,8 @@ namespace NinjaTrader.NinjaScript.Strategies
                     Stop1Adjusted = false, 
                     RunnerStopAdjusted = false, 
                     DisplayNotified = false,
-                    ScratchTargetPrice = 0
+                    ScratchTargetPrice = 0,
+                    HasRunner = true
                 }; 
             }
             
@@ -630,8 +665,16 @@ namespace NinjaTrader.NinjaScript.Strategies
             else AtmStrategyCreate(OrderAction.Sell, OrderType.StopLimit, limitPrice, entryPrice, TimeInForce.Gtc, uniqueOrderId, selectedAtm, atmId, (errorCode, errorId) => { });
         }
 
-        private void ExecuteSmartLong()
+        private void ExecuteSmartLong(bool noRunner = false)
         {
+            // Ohne Suffix wuerde der No-Runner-Button das normale Template feuern,
+            // die Runner-Verwaltung aber trotzdem abschalten.
+            if (noRunner && string.IsNullOrWhiteSpace(NoRunnerSuffix))
+            {
+                Draw.TextFixed(this, "SmartOrderError", "ERROR: No-Runner Template Suffix is empty!", TextPosition.Center, Brushes.Red, new NinjaTrader.Gui.Tools.SimpleFont("Arial", 14) { Bold = true }, Brushes.Transparent, Brushes.Transparent, 0);
+                return;
+            }
+
             double h1, l1, h2, l2, c0, open1, close1, tSize; int bar;
             lock(dataLock) { h1 = cHigh1; l1 = cLow1; h2 = cHigh2; l2 = cLow2; open1 = cOpen1; c0 = cClose0; close1 = cClose1; bar = cBar; tSize = cTickSize; }
             if (bar < 2) return;
@@ -681,18 +724,27 @@ namespace NinjaTrader.NinjaScript.Strategies
                 Print($"[{DateTime.Now.ToString("HH:mm:ss.fff")}] Smart Long: Risk OK. Direct trigger entry.");
             }
             trapBarNumber = bar;
-            trapAtmTemplateLong = availableAtms[currentAtmIndex]; 
+            trapNoRunnerLong = noRunner;
+            trapAtmTemplateLong = noRunner ? availableAtms[currentAtmIndex] + NoRunnerSuffix : availableAtms[currentAtmIndex];
             trapLongActive = true;
             trapShortActive = false; 
             
             Draw.HorizontalLine(this, "TrapTrigger", trapTriggerPrice, Brushes.Orange, DashStyleHelper.Dash, 2);
             Draw.HorizontalLine(this, "TrapLimit", trapLimitPrice, Brushes.DodgerBlue, DashStyleHelper.Solid, 2);
             RemoveDrawObject("SmartOrderError");
-            Print($"[{DateTime.Now.ToString("HH:mm:ss.fff")}] Smart Long Trap Armed. Limit: {trapLimitPrice}, SL: {trapStopLossPrice}");
+            Print($"[{DateTime.Now.ToString("HH:mm:ss.fff")}] Smart Long Trap Armed. Limit: {trapLimitPrice}, SL: {trapStopLossPrice}, ATM: {trapAtmTemplateLong}");
         }
 
-        private void ExecuteSmartShort()
+        private void ExecuteSmartShort(bool noRunner = false)
         {
+            // Ohne Suffix wuerde der No-Runner-Button das normale Template feuern,
+            // die Runner-Verwaltung aber trotzdem abschalten.
+            if (noRunner && string.IsNullOrWhiteSpace(NoRunnerSuffix))
+            {
+                Draw.TextFixed(this, "SmartOrderError", "ERROR: No-Runner Template Suffix is empty!", TextPosition.Center, Brushes.Red, new NinjaTrader.Gui.Tools.SimpleFont("Arial", 14) { Bold = true }, Brushes.Transparent, Brushes.Transparent, 0);
+                return;
+            }
+
             double h1, l1, h2, l2, c0, open1, close1, tSize; int bar;
             lock(dataLock) { h1 = cHigh1; l1 = cLow1; h2 = cHigh2; l2 = cLow2; open1 = cOpen1; c0 = cClose0; close1 = cClose1; bar = cBar; tSize = cTickSize; }
             if (bar < 2) return;
@@ -742,14 +794,15 @@ namespace NinjaTrader.NinjaScript.Strategies
             }
 
             trapBarNumber = bar;
-            trapAtmTemplateShort = availableAtms[currentAtmIndex]; 
+            trapNoRunnerShort = noRunner;
+            trapAtmTemplateShort = noRunner ? availableAtms[currentAtmIndex] + NoRunnerSuffix : availableAtms[currentAtmIndex];
             trapShortActive = true;
             trapLongActive = false; 
             
             Draw.HorizontalLine(this, "TrapTrigger", trapTriggerPrice, Brushes.Orange, DashStyleHelper.Dash, 2);
             Draw.HorizontalLine(this, "TrapLimit", trapLimitPrice, Brushes.DodgerBlue, DashStyleHelper.Solid, 2);
             RemoveDrawObject("SmartOrderError");
-            Print($"[{DateTime.Now.ToString("HH:mm:ss.fff")}] Smart Short Trap Armed. Limit: {trapLimitPrice}, SL: {trapStopLossPrice}");
+            Print($"[{DateTime.Now.ToString("HH:mm:ss.fff")}] Smart Short Trap Armed. Limit: {trapLimitPrice}, SL: {trapStopLossPrice}, ATM: {trapAtmTemplateShort}");
         }
 
         private void ExecuteDeepSmartLong()
@@ -786,6 +839,7 @@ namespace NinjaTrader.NinjaScript.Strategies
 
             trapStopLossPrice = structuralStop;
             trapBarNumber = bar;
+            trapNoRunnerLong = false;
             trapAtmTemplateLong = availableAtms[currentAtmIndex]; 
             trapLongActive = true;
             trapShortActive = false; 
@@ -829,6 +883,7 @@ namespace NinjaTrader.NinjaScript.Strategies
 
             trapStopLossPrice = structuralStop;
             trapBarNumber = bar;
+            trapNoRunnerShort = false;
             trapAtmTemplateShort = availableAtms[currentAtmIndex]; 
             trapLongActive = false;
             trapShortActive = true; 
@@ -942,7 +997,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 string atmId = GetAtmStrategyUniqueId();
                 string uniqueOrderId = "TrapLong_" + atmId;
                 
-                lock(listLock) { trackedAtms[atmId] = new AtmState { AtmId = atmId, EntryOrderId = uniqueOrderId, Direction = AtmDirection.Long, EntryPrice = 0, BeTriggered = false, IntendedStopPrice = trapStopLossPrice, TriggerPrice = trapTriggerPrice, SetupBarIndex = cBar, Stop1Adjusted = false, RunnerStopAdjusted = false, DisplayNotified = false, ScratchTargetPrice = 0 }; }
+                lock(listLock) { trackedAtms[atmId] = new AtmState { AtmId = atmId, EntryOrderId = uniqueOrderId, Direction = AtmDirection.Long, EntryPrice = 0, BeTriggered = false, IntendedStopPrice = trapStopLossPrice, TriggerPrice = trapTriggerPrice, SetupBarIndex = cBar, Stop1Adjusted = false, RunnerStopAdjusted = false, DisplayNotified = false, ScratchTargetPrice = 0, HasRunner = !trapNoRunnerLong }; }
                 AtmStrategyCreate(OrderAction.Buy, OrderType.Limit, trapLimitPrice, 0, TimeInForce.Gtc, uniqueOrderId, trapAtmTemplateLong, atmId, (errorCode, errorId) => { });
             }
 
@@ -953,7 +1008,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 string atmId = GetAtmStrategyUniqueId();
                 string uniqueOrderId = "TrapShort_" + atmId;
                 
-                lock(listLock) { trackedAtms[atmId] = new AtmState { AtmId = atmId, EntryOrderId = uniqueOrderId, Direction = AtmDirection.Short, EntryPrice = 0, BeTriggered = false, IntendedStopPrice = trapStopLossPrice, TriggerPrice = trapTriggerPrice, SetupBarIndex = cBar, Stop1Adjusted = false, RunnerStopAdjusted = false, DisplayNotified = false, ScratchTargetPrice = 0 }; }
+                lock(listLock) { trackedAtms[atmId] = new AtmState { AtmId = atmId, EntryOrderId = uniqueOrderId, Direction = AtmDirection.Short, EntryPrice = 0, BeTriggered = false, IntendedStopPrice = trapStopLossPrice, TriggerPrice = trapTriggerPrice, SetupBarIndex = cBar, Stop1Adjusted = false, RunnerStopAdjusted = false, DisplayNotified = false, ScratchTargetPrice = 0, HasRunner = !trapNoRunnerShort }; }
                 AtmStrategyCreate(OrderAction.Sell, OrderType.Limit, trapLimitPrice, 0, TimeInForce.Gtc, uniqueOrderId, trapAtmTemplateShort, atmId, (errorCode, errorId) => { });
             }
 
@@ -1072,7 +1127,9 @@ namespace NinjaTrader.NinjaScript.Strategies
                                 }
                             }
 
-                            if (state.EntryComplete && !state.RunnerStopAdjusted)
+                            // Ohne Runner existiert kein Stop2 - jede Abfrage wuerde nur
+                            // "Order name 'Stop2' is invalid" ins Log schreiben.
+                            if (state.HasRunner && state.EntryComplete && !state.RunnerStopAdjusted)
                             {
                                 string[,] s2Status = GetAtmStrategyStopTargetOrderStatus(RunnerStopName, state.AtmId);
                                 if (s2Status != null && s2Status.GetLength(0) > 0 && s2Status.GetLength(1) > 2)
@@ -1094,7 +1151,9 @@ namespace NinjaTrader.NinjaScript.Strategies
                             }
                         }
 
-                        if (EnableAutoBreakeven && state.EntryPrice != 0 && !state.BeTriggered)
+                        // Ohne Runner schliesst Target1 die komplette Position, ein BE-Stop
+                        // waere also gegenstandslos.
+                        if (EnableAutoBreakeven && state.HasRunner && state.EntryPrice != 0 && !state.BeTriggered)
                         {
                             string[,] t1Status = GetAtmStrategyStopTargetOrderStatus(Target1Name, state.AtmId);
                             if (t1Status != null && t1Status.GetLength(0) > 0 && t1Status.GetLength(1) > 2)
