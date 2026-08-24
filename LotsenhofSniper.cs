@@ -60,6 +60,7 @@ namespace NinjaTrader.NinjaScript.Strategies
         private Button deepSellButton;
         private Button momentumBuyButton;
         private Button momentumSellButton;
+        private TextBlock lockoutLabel;
         private Button noRunnerBuyButton;
         private Button noRunnerSellButton;
         private Button scratchButton;
@@ -90,6 +91,14 @@ namespace NinjaTrader.NinjaScript.Strategies
         private object listLock = new object();
         
         private Dictionary<string, AtmState> trackedAtms = new Dictionary<string, AtmState>();
+
+        // Revenge-Trading-Sperre
+        private NinjaTrader.Data.SessionIterator lockoutSession;
+        private Account lockoutAccount;
+        private string lockoutFilePath = "";
+        private DateTime lockoutTradingDay = DateTime.MinValue;
+        private int lossesToday = 0;
+        private bool tradingLocked = false;
         
         [NinjaScriptProperty]
         [Display(Name="ATM Strategies List", Description="Comma separated list of ATM templates", Order=1, GroupName="1. Parameters")]
@@ -205,6 +214,20 @@ namespace NinjaTrader.NinjaScript.Strategies
         public int TrailBufferTicks { get; set; }
 
         [NinjaScriptProperty]
+        [Display(Name="Enable Daily Loss Lockout", Description="Sperrt nach der eingestellten Anzahl Verlust-Trades auf dem gewaehlten Konto alle Einstiege bis zum naechsten Handelstag. Scratch und Cancel bleiben aktiv.", Order=1, GroupName="6. Risk Lockout")]
+        public bool EnableDailyLossLockout { get; set; }
+
+        [NinjaScriptProperty]
+        [Range(1, 20)]
+        [Display(Name="Losses Until Lockout", Description="Anzahl Verlust-Trades auf dem Konto, nach denen gesperrt wird.", Order=2, GroupName="6. Risk Lockout")]
+        public int LossesUntilLockout { get; set; }
+
+        [NinjaScriptProperty]
+        [Range(0.0, 1000000.0)]
+        [Display(Name="Min Loss to Count (Currency)", Description="Verluste unterhalb dieses Betrags werden ignoriert (0 = jeder Verlust zaehlt). Verhindert, dass ein Scratch mit Kommission den Tag sperrt.", Order=3, GroupName="6. Risk Lockout")]
+        public double MinLossToCount { get; set; }
+
+        [NinjaScriptProperty]
         [Display(Name="Hotkey LONG (Smart)", Description="Key for Smart Long Entry", Order=1, GroupName="3. Hotkeys")]
         public SniperKey HotkeyLong { get; set; }
 
@@ -262,6 +285,9 @@ namespace NinjaTrader.NinjaScript.Strategies
                 SwingStrength               = 2;
                 MinSwingSizeTicks           = 8;  // pivot must protrude at least 2 points on ES
                 TrailBufferTicks            = 1;
+                EnableDailyLossLockout      = true;
+                LossesUntilLockout          = 1;
+                MinLossToCount              = 0;
 
                 HotkeyLong                  = SniperKey.W;
                 HotkeyShort                 = SniperKey.S; 
@@ -285,6 +311,8 @@ namespace NinjaTrader.NinjaScript.Strategies
                     }
                 }
                 currentAtmIndex = 0;
+                lockoutSession = new NinjaTrader.Data.SessionIterator(Bars);
+                lockoutFilePath = System.IO.Path.Combine(NinjaTrader.Core.Globals.UserDataDir, "LotsenhofSniper_lockout.txt");
                 Match match = Regex.Match(availableAtms[currentAtmIndex], @"\d+");
                 if (match.Success) {
                     MaxRiskTicks = int.Parse(match.Value) - 1;
@@ -298,6 +326,16 @@ namespace NinjaTrader.NinjaScript.Strategies
                 {
                     ChartControl.Dispatcher.InvokeAsync(() => { CreateWPFControls(); });
                 }
+            }
+            else if (State == State.Realtime)
+            {
+                // Erst hier steht das gewaehlte Konto sicher zur Verfuegung.
+                lockoutAccount = Account;
+                if (lockoutAccount != null) lockoutAccount.AddTrade += OnAccountAddTrade;
+                else if (EnableDailyLossLockout) Print($"[{DateTime.Now.ToString("HH:mm:ss.fff")}] WARNING: no account attached, daily loss lockout is inactive.");
+                RefreshTradingDay(true);
+                if (EnableDailyLossLockout)
+                    Print($"[{DateTime.Now.ToString("HH:mm:ss.fff")}] Loss lockout armed for {AccountLabel()}, trading day {lockoutTradingDay:yyyy-MM-dd}, locked: {tradingLocked}. File: {lockoutFilePath}");
             }
             else if (State == State.Terminated)
             {
@@ -313,6 +351,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 RemoveDrawObject("Scratch_Notice");
                 RemoveDrawObject("PartialFill_Notice");
                 RemoveDrawObject("Trail_Notice");
+                if (lockoutAccount != null) { lockoutAccount.AddTrade -= OnAccountAddTrade; lockoutAccount = null; }
                 lock(listLock) { trackedAtms.Clear(); }
             }
         }
@@ -326,7 +365,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 Margin = new Thickness(0, 30, 10, 0)
             };
 
-            for(int i=0; i<9; i++) myGrid.RowDefinitions.Add(new RowDefinition());
+            for(int i=0; i<10; i++) myGrid.RowDefinitions.Add(new RowDefinition());
             // Spalte 0 = Standard-ATM (mit Runner), Spalte 1 = No-Runner-Variante.
             for(int i=0; i<2; i++) myGrid.ColumnDefinitions.Add(new ColumnDefinition());
 
@@ -408,6 +447,21 @@ namespace NinjaTrader.NinjaScript.Strategies
             Grid.SetRow(cancelButton, 8);
             Grid.SetColumnSpan(cancelButton, 2);
 
+            lockoutLabel = new TextBlock
+            {
+                Text = "",
+                Foreground = Brushes.White,
+                Background = Brushes.DarkRed,
+                FontWeight = FontWeights.Bold,
+                TextAlignment = TextAlignment.Center,
+                TextWrapping = TextWrapping.Wrap,
+                Margin = new Thickness(2),
+                Padding = new Thickness(6, 4, 6, 4),
+                Visibility = Visibility.Collapsed
+            };
+            Grid.SetRow(lockoutLabel, 9);
+            Grid.SetColumnSpan(lockoutLabel, 2);
+
             myGrid.Children.Add(atmToggleButton);
             myGrid.Children.Add(buyButton);
             myGrid.Children.Add(sellButton);
@@ -421,6 +475,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             }
             myGrid.Children.Add(scratchButton);
             myGrid.Children.Add(cancelButton);
+            myGrid.Children.Add(lockoutLabel);
             
             UserControlCollection.Add(myGrid);
 
@@ -455,6 +510,178 @@ namespace NinjaTrader.NinjaScript.Strategies
             else if (IsHotkeyPressed(HotkeyCancel, e)) { e.Handled = true; TriggerCustomEvent(state => ExecuteCancel(), null); }
             else if (IsHotkeyPressed(HotkeyScratch, e)) { e.Handled = true; TriggerCustomEvent(state => ExecuteScratch(), null); }
         }
+
+        #region Revenge-Trading-Sperre
+
+        // Laeuft auf dem Account-Thread. Hier nur filtern, alles Weitere wandert
+        // ueber TriggerCustomEvent auf den Strategie-Thread.
+        private void OnAccountAddTrade(object sender, AddTradeEventArgs e)
+        {
+            if (!EnableDailyLossLockout || e == null || e.Trade == null) return;
+
+            double pnl = e.Trade.ProfitCurrency;
+            if (pnl >= 0) return;
+            if (MinLossToCount > 0 && -pnl < MinLossToCount) return;
+
+            TriggerCustomEvent(o => RegisterLoss(pnl), null);
+        }
+
+        private void RegisterLoss(double pnl)
+        {
+            RefreshTradingDay();
+            if (tradingLocked) return;
+
+            lossesToday++;
+            Print($"[{DateTime.Now.ToString("HH:mm:ss.fff")}] Loss registered on {AccountLabel()}: {pnl:0.00} ({lossesToday}/{LossesUntilLockout}).");
+
+            if (lossesToday >= LossesUntilLockout) ApplyLockout();
+        }
+
+        private void ApplyLockout()
+        {
+            tradingLocked = true;
+
+            // Ein bereits scharfer Trap wuerde sonst nach der Sperre noch ausloesen.
+            trapLongActive = false;
+            trapShortActive = false;
+            RemoveDrawObject("TrapTrigger");
+            RemoveDrawObject("TrapLimit");
+
+            PersistLockout();
+            UpdateLockoutUi();
+
+            Print($"[{DateTime.Now.ToString("HH:mm:ss.fff")}] TRADING LOCKED for {lockoutTradingDay:yyyy-MM-dd} on {AccountLabel()} after {lossesToday} loss(es). Scratch and Cancel stay active.");
+        }
+
+        // Handelstag = Session-Rollover des Instruments, damit die Sperre auf derselben
+        // Grenze zurueckgesetzt wird, auf der NT die Tages-P&L zuruecksetzt.
+        private void RefreshTradingDay(bool force = false)
+        {
+            // Faellt der Session-Kalender aus, ist der Kalendertag immer noch
+            // besser als gar keine Sperre.
+            DateTime day = DateTime.Today;
+            if (lockoutSession != null)
+            {
+                try { day = lockoutSession.GetTradingDay(DateTime.Now).Date; }
+                catch { day = DateTime.Today; }
+            }
+
+            if (day == lockoutTradingDay && !force) return;
+
+            lockoutTradingDay = day;
+            lossesToday = 0;
+            tradingLocked = IsLockoutPersisted(day);
+            UpdateLockoutUi();
+
+            if (tradingLocked)
+                Print($"[{DateTime.Now.ToString("HH:mm:ss.fff")}] Lockout restored from disk: {AccountLabel()} stays blocked for {day:yyyy-MM-dd}.");
+        }
+
+        private bool IsTradingBlocked()
+        {
+            if (!EnableDailyLossLockout) return false;
+
+            RefreshTradingDay();
+            if (!tradingLocked) return false;
+
+            Draw.TextFixed(this, "SmartOrderError", $"BLOCKED: daily loss lockout active on {AccountLabel()}.\nNo new entries until the next trading day.", TextPosition.Center, Brushes.Red, new NinjaTrader.Gui.Tools.SimpleFont("Arial", 14) { Bold = true }, Brushes.Transparent, Brushes.Transparent, 0);
+            Print($"[{DateTime.Now.ToString("HH:mm:ss.fff")}] Entry blocked: daily loss lockout active on {AccountLabel()} for {lockoutTradingDay:yyyy-MM-dd}.");
+            return true;
+        }
+
+        private string AccountLabel()
+        {
+            return lockoutAccount != null ? lockoutAccount.Name : "<no account>";
+        }
+
+        private string LockoutKey(string accountName, DateTime day)
+        {
+            return accountName + "|" + day.ToString("yyyy-MM-dd");
+        }
+
+        private bool IsLockoutPersisted(DateTime day)
+        {
+            if (string.IsNullOrEmpty(lockoutFilePath) || lockoutAccount == null) return false;
+
+            string key = LockoutKey(lockoutAccount.Name, day);
+            try
+            {
+                if (!System.IO.File.Exists(lockoutFilePath)) return false;
+                foreach (string line in System.IO.File.ReadAllLines(lockoutFilePath))
+                    if (line.Trim() == key) return true;
+            }
+            catch (Exception ex)
+            {
+                Print($"[{DateTime.Now.ToString("HH:mm:ss.fff")}] Lockout file not readable ({ex.Message}).");
+            }
+            return false;
+        }
+
+        // Die Sperre muss einen Neustart der Strategie ueberleben - sonst ist sie
+        // genau in dem Moment weg, in dem man sie braucht.
+        private void PersistLockout()
+        {
+            if (string.IsNullOrEmpty(lockoutFilePath) || lockoutAccount == null) return;
+
+            string key = LockoutKey(lockoutAccount.Name, lockoutTradingDay);
+            try
+            {
+                List<string> keep = new List<string>();
+                if (System.IO.File.Exists(lockoutFilePath))
+                {
+                    DateTime cutoff = DateTime.Today.AddDays(-7);
+                    foreach (string line in System.IO.File.ReadAllLines(lockoutFilePath))
+                    {
+                        string entry = line.Trim();
+                        if (entry.Length == 0 || entry == key) continue;
+
+                        int sep = entry.LastIndexOf('|');
+                        if (sep < 0) continue;
+
+                        DateTime parsed;
+                        if (!DateTime.TryParseExact(entry.Substring(sep + 1), "yyyy-MM-dd", System.Globalization.CultureInfo.InvariantCulture, System.Globalization.DateTimeStyles.None, out parsed)) continue;
+                        if (parsed >= cutoff) keep.Add(entry);
+                    }
+                }
+                keep.Add(key);
+                System.IO.File.WriteAllLines(lockoutFilePath, keep.ToArray());
+            }
+            catch (Exception ex)
+            {
+                Print($"[{DateTime.Now.ToString("HH:mm:ss.fff")}] WARNING: lockout could not be written to {lockoutFilePath} ({ex.Message}). It is active for this session only.");
+            }
+        }
+
+        private void UpdateLockoutUi()
+        {
+            if (ChartControl == null) return;
+
+            bool locked = tradingLocked;
+            int losses = lossesToday;
+            string account = AccountLabel();
+
+            ChartControl.Dispatcher.InvokeAsync(() =>
+            {
+                if (buyButton != null)          buyButton.IsEnabled          = !locked;
+                if (sellButton != null)         sellButton.IsEnabled         = !locked;
+                if (noRunnerBuyButton != null)  noRunnerBuyButton.IsEnabled  = !locked;
+                if (noRunnerSellButton != null) noRunnerSellButton.IsEnabled = !locked;
+                if (deepBuyButton != null)      deepBuyButton.IsEnabled      = !locked;
+                if (deepSellButton != null)     deepSellButton.IsEnabled     = !locked;
+                if (momentumBuyButton != null)  momentumBuyButton.IsEnabled  = !locked;
+                if (momentumSellButton != null) momentumSellButton.IsEnabled = !locked;
+
+                if (lockoutLabel != null)
+                {
+                    lockoutLabel.Text = losses > 0
+                        ? $"TRADING LOCKED - {losses} loss(es) on {account}"
+                        : $"TRADING LOCKED on {account}";
+                    lockoutLabel.Visibility = locked ? Visibility.Visible : Visibility.Collapsed;
+                }
+            });
+        }
+
+        #endregion
 
         private void ExecuteCancel()
         {
@@ -561,6 +788,8 @@ namespace NinjaTrader.NinjaScript.Strategies
 
         private void ExecuteMomentumLong()
         {
+            if (IsTradingBlocked()) return;
+
             RemoveDrawObject("SmartOrderError");
             double h1, l1, h2, l2, c0, tSize; int bar;
             
@@ -614,6 +843,8 @@ namespace NinjaTrader.NinjaScript.Strategies
 
         private void ExecuteMomentumShort()
         {
+            if (IsTradingBlocked()) return;
+
             RemoveDrawObject("SmartOrderError");
             double h1, l1, h2, l2, c0, tSize; int bar;
             
@@ -667,6 +898,8 @@ namespace NinjaTrader.NinjaScript.Strategies
 
         private void ExecuteSmartLong(bool noRunner = false)
         {
+            if (IsTradingBlocked()) return;
+
             // Ohne Suffix wuerde der No-Runner-Button das normale Template feuern,
             // die Runner-Verwaltung aber trotzdem abschalten.
             if (noRunner && string.IsNullOrWhiteSpace(NoRunnerSuffix))
@@ -737,6 +970,8 @@ namespace NinjaTrader.NinjaScript.Strategies
 
         private void ExecuteSmartShort(bool noRunner = false)
         {
+            if (IsTradingBlocked()) return;
+
             // Ohne Suffix wuerde der No-Runner-Button das normale Template feuern,
             // die Runner-Verwaltung aber trotzdem abschalten.
             if (noRunner && string.IsNullOrWhiteSpace(NoRunnerSuffix))
@@ -807,6 +1042,8 @@ namespace NinjaTrader.NinjaScript.Strategies
 
         private void ExecuteDeepSmartLong()
         {
+            if (IsTradingBlocked()) return;
+
             double h1, l1, h2, l2, c0, tSize; int bar;
             lock(dataLock) { h1 = cHigh1; l1 = cLow1; h2 = cHigh2; l2 = cLow2; c0 = cClose0; bar = cBar; tSize = cTickSize; }
             if (bar < 2) return;
@@ -851,6 +1088,8 @@ namespace NinjaTrader.NinjaScript.Strategies
 
         private void ExecuteDeepSmartShort()
         {
+            if (IsTradingBlocked()) return;
+
             double h1, l1, h2, l2, c0, tSize; int bar;
             lock(dataLock) { h1 = cHigh1; l1 = cLow1; h2 = cHigh2; l2 = cLow2; c0 = cClose0; bar = cBar; tSize = cTickSize; }
             if (bar < 2) return;
@@ -973,6 +1212,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             if (CurrentBar < 2) return; 
 
             bool isNewBar = IsFirstTickOfBar;
+            if (isNewBar && EnableDailyLossLockout && State == State.Realtime) RefreshTradingDay();
 
             lock(dataLock)
             {
@@ -990,7 +1230,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             if (trapLongActive && CurrentBar > trapBarNumber) { trapLongActive = false; RemoveDrawObject("TrapTrigger"); RemoveDrawObject("TrapLimit"); }
             if (trapShortActive && CurrentBar > trapBarNumber) { trapShortActive = false; RemoveDrawObject("TrapTrigger"); RemoveDrawObject("TrapLimit"); }
 
-            if (trapLongActive && High[0] >= trapTriggerPrice)
+            if (trapLongActive && !tradingLocked && High[0] >= trapTriggerPrice)
             {
                 trapLongActive = false; 
                 RemoveDrawObject("TrapTrigger"); RemoveDrawObject("TrapLimit"); 
@@ -1001,7 +1241,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 AtmStrategyCreate(OrderAction.Buy, OrderType.Limit, trapLimitPrice, 0, TimeInForce.Gtc, uniqueOrderId, trapAtmTemplateLong, atmId, (errorCode, errorId) => { });
             }
 
-            if (trapShortActive && Low[0] <= trapTriggerPrice)
+            if (trapShortActive && !tradingLocked && Low[0] <= trapTriggerPrice)
             {
                 trapShortActive = false; 
                 RemoveDrawObject("TrapTrigger"); RemoveDrawObject("TrapLimit"); 
