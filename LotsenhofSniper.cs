@@ -46,6 +46,7 @@ namespace NinjaTrader.NinjaScript.Strategies
         public double CurrentRunnerStop;
         public bool PositionSeen;
         public bool EntryComplete;
+        public bool EntryCancelRequested;
     }
 
     public class LotsenhofSniper : Strategy
@@ -127,6 +128,11 @@ namespace NinjaTrader.NinjaScript.Strategies
         [Range(1, 10)]
         [Display(Name="Bars to Wait", Description="How many bars to keep a pending limit order alive before automatic cancellation.", Order=9, GroupName="1. Parameters")]
         public int BarsToWait { get; set; }
+
+        [NinjaScriptProperty]
+        [Range(1, 100)]
+        [Display(Name="Cancel Partial Fill After (Ticks)", Description="Nach einem Teilfill: storniert die Restmenge der Entry-Order, sobald der Preis so viele Ticks in Profitrichtung vom Einstand weggelaufen ist.", Order=12, GroupName="1. Parameters")]
+        public int PartialFillCancelTicks { get; set; }
 
         [NinjaScriptProperty]
         [Display(Name="Show only Smart buttons", Description="If true, only smart long/short entry buttons are showed.", Order=10, GroupName="1. Parameters")]
@@ -234,6 +240,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 EnableTradingNonPerfectBars = false;
                 AutoBreakevenOffset         = 0;
                 BarsToWait                  = 3; // Pending limit orders stay alive for 3 bars
+                PartialFillCancelTicks      = 10;
                 ShowOnlySmartButtons        = true;
                 Target1Name                 = "Target1";
                 Stop1Name                   = "Stop1";
@@ -294,6 +301,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 RemoveDrawObject("BE_Notice");
                 RemoveDrawObject("SL_Notice");
                 RemoveDrawObject("Scratch_Notice");
+                RemoveDrawObject("PartialFill_Notice");
                 RemoveDrawObject("Trail_Notice");
                 lock(listLock) { trackedAtms.Clear(); }
             }
@@ -426,6 +434,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             RemoveDrawObject("BE_Notice");
             RemoveDrawObject("SL_Notice");
             RemoveDrawObject("Scratch_Notice");
+            RemoveDrawObject("PartialFill_Notice");
             RemoveDrawObject("Trail_Notice");
 
             lock(listLock)
@@ -1029,6 +1038,24 @@ namespace NinjaTrader.NinjaScript.Strategies
                             }
                         }
 
+                        // Teilfill: die Restmenge haengt sonst weiter im Markt und kann uns nach TP1
+                        // erneut in eine Position werfen. Ist der Preis PartialFillCancelTicks in
+                        // Profitrichtung weggelaufen, fuellt sie ohnehin nicht mehr sauber -> stornieren.
+                        if (!state.EntryComplete && !state.EntryCancelRequested && state.EntryPrice != 0)
+                        {
+                            double runTicks = state.Direction == AtmDirection.Long
+                                ? (High[0] - state.EntryPrice) / cTickSize
+                                : (state.EntryPrice - Low[0]) / cTickSize;
+
+                            if (runTicks >= PartialFillCancelTicks)
+                            {
+                                state.EntryCancelRequested = true;
+                                AtmStrategyCancelEntryOrder(state.AtmId);
+                                Draw.TextFixed(this, "PartialFill_Notice", $"PARTIAL FILL: rest of entry cancelled ({PartialFillCancelTicks} ticks run)", TextPosition.TopRight, Brushes.Orange, new NinjaTrader.Gui.Tools.SimpleFont("Arial", 12) { Bold = true }, Brushes.Transparent, Brushes.Transparent, 0);
+                                Print($"[{DateTime.Now.ToString("HH:mm:ss.fff")}] Partial fill: cancelling remaining entry quantity, price ran {Math.Floor(runTicks)} ticks past entry {state.EntryPrice}.");
+                            }
+                        }
+
                         if (state.EntryPrice != 0 && state.IntendedStopPrice > 0)
                         {
                             if (!state.Stop1Adjusted)
@@ -1108,6 +1135,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                         RemoveDrawObject("Trail_Notice");
                         RemoveDrawObject("SL_Notice");
                         RemoveDrawObject("Scratch_Notice");
+                        RemoveDrawObject("PartialFill_Notice");
                     }
                 }
             }
