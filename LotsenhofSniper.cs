@@ -48,6 +48,9 @@ namespace NinjaTrader.NinjaScript.Strategies
         public bool EntryComplete;
         public bool EntryCancelRequested;
         public bool HasRunner;
+        public string TemplateName;
+        public DateTime CreatedAt;
+        public bool EntryStatusSeen;
     }
 
     public class LotsenhofSniper : Strategy
@@ -91,6 +94,10 @@ namespace NinjaTrader.NinjaScript.Strategies
         private object listLock = new object();
         
         private Dictionary<string, AtmState> trackedAtms = new Dictionary<string, AtmState>();
+
+        // Wie lange eine frisch erzeugte ATM Zeit bekommt, sich zu melden,
+        // bevor wir sie als nie entstanden verwerfen.
+        private const double AtmStartupGraceSeconds = 5.0;
 
         // Revenge-Trading-Sperre
         private NinjaTrader.Data.SessionIterator lockoutSession;
@@ -511,6 +518,44 @@ namespace NinjaTrader.NinjaScript.Strategies
             else if (IsHotkeyPressed(HotkeyScratch, e)) { e.Handled = true; TriggerCustomEvent(state => ExecuteScratch(), null); }
         }
 
+        // Ob ein ATM-Template existiert, laesst sich nur ueber die Datei pruefen.
+        // Ohne diese Vorpruefung faellt ein Tippfehler oder ein geloeschtes Template
+        // erst auf, wenn der Trap ausloest - also im denkbar schlechtesten Moment.
+        // Im Zweifel (Pfad unlesbar) lassen wir durch, statt den Handel zu blockieren.
+        private bool IsAtmTemplateMissing(string templateName)
+        {
+            if (string.IsNullOrWhiteSpace(templateName)) return true;
+
+            string path;
+            try { path = System.IO.Path.Combine(NinjaTrader.Core.Globals.UserDataDir, "templates", "AtmStrategy", templateName + ".xml"); }
+            catch { return false; }
+
+            try { if (System.IO.File.Exists(path)) return false; }
+            catch { return false; }
+
+            Draw.TextFixed(this, "SmartOrderError", $"ERROR: ATM template '{templateName}' not found!\n{path}", TextPosition.Center, Brushes.Red, new NinjaTrader.Gui.Tools.SimpleFont("Arial", 12) { Bold = true }, Brushes.Transparent, Brushes.Transparent, 0);
+            Print($"[{DateTime.Now.ToString("HH:mm:ss.fff")}] ATM template '{templateName}' does not exist ({path}) - entry aborted before arming.");
+            return true;
+        }
+
+        // AtmStrategyCreate meldet Fehler ausschliesslich ueber diesen Callback.
+        // Wird er ignoriert, sieht ein fehlgeschlagener Einstieg (z.B. fehlendes
+        // Template) von aussen wie eine stille Stornierung aus.
+        private void OnAtmCreateResult(ErrorCode errorCode, string errorMessage, string atmId, string templateName)
+        {
+            if (errorCode == ErrorCode.NoError) return;
+            TriggerCustomEvent(o => ReportAtmCreateFailure(errorCode, errorMessage, atmId, templateName), null);
+        }
+
+        private void ReportAtmCreateFailure(ErrorCode errorCode, string errorMessage, string atmId, string templateName)
+        {
+            lock(listLock) { trackedAtms.Remove(atmId); }
+
+            string detail = string.IsNullOrWhiteSpace(errorMessage) ? errorCode.ToString() : $"{errorCode} - {errorMessage}";
+            Draw.TextFixed(this, "SmartOrderError", $"ATM CREATE FAILED (template '{templateName}')\n{detail}", TextPosition.Center, Brushes.Red, new NinjaTrader.Gui.Tools.SimpleFont("Arial", 12) { Bold = true }, Brushes.Transparent, Brushes.Transparent, 0);
+            Print($"[{DateTime.Now.ToString("HH:mm:ss.fff")}] AtmStrategyCreate failed for template '{templateName}': {detail}. Tracking for {atmId} dropped.");
+        }
+
         #region Revenge-Trading-Sperre
 
         // Laeuft auf dem Account-Thread. Hier nur filtern, alles Weitere wandert
@@ -816,6 +861,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             string atmId = GetAtmStrategyUniqueId();
             string uniqueOrderId = "MomLong_" + atmId; 
             string selectedAtm = availableAtms[currentAtmIndex];
+            if (IsAtmTemplateMissing(selectedAtm)) return;
             
             lock(listLock) 
             { 
@@ -833,12 +879,14 @@ namespace NinjaTrader.NinjaScript.Strategies
                     RunnerStopAdjusted = false, 
                     DisplayNotified = false,
                     ScratchTargetPrice = 0,
-                    HasRunner = true
+                    HasRunner = true,
+                    TemplateName = selectedAtm,
+                    CreatedAt = DateTime.Now
                 }; 
             }
             
-            if(c0 >= entryPrice) AtmStrategyCreate(OrderAction.Buy, OrderType.Limit, limitPrice, 0, TimeInForce.Gtc, uniqueOrderId, selectedAtm, atmId, (errorCode, errorId) => { });
-            else AtmStrategyCreate(OrderAction.Buy, OrderType.StopLimit, limitPrice, entryPrice, TimeInForce.Gtc, uniqueOrderId, selectedAtm, atmId, (errorCode, errorId) => { });
+            if(c0 >= entryPrice) AtmStrategyCreate(OrderAction.Buy, OrderType.Limit, limitPrice, 0, TimeInForce.Gtc, uniqueOrderId, selectedAtm, atmId, (errorCode, errorMessage) => OnAtmCreateResult(errorCode, errorMessage, atmId, selectedAtm));
+            else AtmStrategyCreate(OrderAction.Buy, OrderType.StopLimit, limitPrice, entryPrice, TimeInForce.Gtc, uniqueOrderId, selectedAtm, atmId, (errorCode, errorMessage) => OnAtmCreateResult(errorCode, errorMessage, atmId, selectedAtm));
         }
 
         private void ExecuteMomentumShort()
@@ -871,6 +919,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             string atmId = GetAtmStrategyUniqueId();
             string uniqueOrderId = "MomShort_" + atmId; 
             string selectedAtm = availableAtms[currentAtmIndex];
+            if (IsAtmTemplateMissing(selectedAtm)) return;
             
             lock(listLock) 
             { 
@@ -888,12 +937,14 @@ namespace NinjaTrader.NinjaScript.Strategies
                     RunnerStopAdjusted = false, 
                     DisplayNotified = false,
                     ScratchTargetPrice = 0,
-                    HasRunner = true
+                    HasRunner = true,
+                    TemplateName = selectedAtm,
+                    CreatedAt = DateTime.Now
                 }; 
             }
             
-            if(c0 <= entryPrice) AtmStrategyCreate(OrderAction.Sell, OrderType.Limit, limitPrice, 0, TimeInForce.Gtc, uniqueOrderId, selectedAtm, atmId, (errorCode, errorId) => { });
-            else AtmStrategyCreate(OrderAction.Sell, OrderType.StopLimit, limitPrice, entryPrice, TimeInForce.Gtc, uniqueOrderId, selectedAtm, atmId, (errorCode, errorId) => { });
+            if(c0 <= entryPrice) AtmStrategyCreate(OrderAction.Sell, OrderType.Limit, limitPrice, 0, TimeInForce.Gtc, uniqueOrderId, selectedAtm, atmId, (errorCode, errorMessage) => OnAtmCreateResult(errorCode, errorMessage, atmId, selectedAtm));
+            else AtmStrategyCreate(OrderAction.Sell, OrderType.StopLimit, limitPrice, entryPrice, TimeInForce.Gtc, uniqueOrderId, selectedAtm, atmId, (errorCode, errorMessage) => OnAtmCreateResult(errorCode, errorMessage, atmId, selectedAtm));
         }
 
         private void ExecuteSmartLong(bool noRunner = false)
@@ -956,9 +1007,12 @@ namespace NinjaTrader.NinjaScript.Strategies
                 trapLimitPrice = triggerPrice; 
                 Print($"[{DateTime.Now.ToString("HH:mm:ss.fff")}] Smart Long: Risk OK. Direct trigger entry.");
             }
+            string templateLong = noRunner ? availableAtms[currentAtmIndex] + NoRunnerSuffix : availableAtms[currentAtmIndex];
+            if (IsAtmTemplateMissing(templateLong)) return;
+
             trapBarNumber = bar;
             trapNoRunnerLong = noRunner;
-            trapAtmTemplateLong = noRunner ? availableAtms[currentAtmIndex] + NoRunnerSuffix : availableAtms[currentAtmIndex];
+            trapAtmTemplateLong = templateLong;
             trapLongActive = true;
             trapShortActive = false; 
             
@@ -1028,9 +1082,12 @@ namespace NinjaTrader.NinjaScript.Strategies
                 Print($"[{DateTime.Now.ToString("HH:mm:ss.fff")}] Smart Short: Risk OK. Direct trigger entry.");
             }
 
+            string templateShort = noRunner ? availableAtms[currentAtmIndex] + NoRunnerSuffix : availableAtms[currentAtmIndex];
+            if (IsAtmTemplateMissing(templateShort)) return;
+
             trapBarNumber = bar;
             trapNoRunnerShort = noRunner;
-            trapAtmTemplateShort = noRunner ? availableAtms[currentAtmIndex] + NoRunnerSuffix : availableAtms[currentAtmIndex];
+            trapAtmTemplateShort = templateShort;
             trapShortActive = true;
             trapLongActive = false; 
             
@@ -1075,6 +1132,8 @@ namespace NinjaTrader.NinjaScript.Strategies
             }
 
             trapStopLossPrice = structuralStop;
+            if (IsAtmTemplateMissing(availableAtms[currentAtmIndex])) return;
+
             trapBarNumber = bar;
             trapNoRunnerLong = false;
             trapAtmTemplateLong = availableAtms[currentAtmIndex]; 
@@ -1121,6 +1180,8 @@ namespace NinjaTrader.NinjaScript.Strategies
             }
 
             trapStopLossPrice = structuralStop;
+            if (IsAtmTemplateMissing(availableAtms[currentAtmIndex])) return;
+
             trapBarNumber = bar;
             trapNoRunnerShort = false;
             trapAtmTemplateShort = availableAtms[currentAtmIndex]; 
@@ -1237,8 +1298,8 @@ namespace NinjaTrader.NinjaScript.Strategies
                 string atmId = GetAtmStrategyUniqueId();
                 string uniqueOrderId = "TrapLong_" + atmId;
                 
-                lock(listLock) { trackedAtms[atmId] = new AtmState { AtmId = atmId, EntryOrderId = uniqueOrderId, Direction = AtmDirection.Long, EntryPrice = 0, BeTriggered = false, IntendedStopPrice = trapStopLossPrice, TriggerPrice = trapTriggerPrice, SetupBarIndex = cBar, Stop1Adjusted = false, RunnerStopAdjusted = false, DisplayNotified = false, ScratchTargetPrice = 0, HasRunner = !trapNoRunnerLong }; }
-                AtmStrategyCreate(OrderAction.Buy, OrderType.Limit, trapLimitPrice, 0, TimeInForce.Gtc, uniqueOrderId, trapAtmTemplateLong, atmId, (errorCode, errorId) => { });
+                lock(listLock) { trackedAtms[atmId] = new AtmState { AtmId = atmId, EntryOrderId = uniqueOrderId, Direction = AtmDirection.Long, EntryPrice = 0, BeTriggered = false, IntendedStopPrice = trapStopLossPrice, TriggerPrice = trapTriggerPrice, SetupBarIndex = cBar, Stop1Adjusted = false, RunnerStopAdjusted = false, DisplayNotified = false, ScratchTargetPrice = 0, HasRunner = !trapNoRunnerLong, TemplateName = trapAtmTemplateLong, CreatedAt = DateTime.Now }; }
+                AtmStrategyCreate(OrderAction.Buy, OrderType.Limit, trapLimitPrice, 0, TimeInForce.Gtc, uniqueOrderId, trapAtmTemplateLong, atmId, (errorCode, errorMessage) => OnAtmCreateResult(errorCode, errorMessage, atmId, trapAtmTemplateLong));
             }
 
             if (trapShortActive && !tradingLocked && Low[0] <= trapTriggerPrice)
@@ -1248,8 +1309,8 @@ namespace NinjaTrader.NinjaScript.Strategies
                 string atmId = GetAtmStrategyUniqueId();
                 string uniqueOrderId = "TrapShort_" + atmId;
                 
-                lock(listLock) { trackedAtms[atmId] = new AtmState { AtmId = atmId, EntryOrderId = uniqueOrderId, Direction = AtmDirection.Short, EntryPrice = 0, BeTriggered = false, IntendedStopPrice = trapStopLossPrice, TriggerPrice = trapTriggerPrice, SetupBarIndex = cBar, Stop1Adjusted = false, RunnerStopAdjusted = false, DisplayNotified = false, ScratchTargetPrice = 0, HasRunner = !trapNoRunnerShort }; }
-                AtmStrategyCreate(OrderAction.Sell, OrderType.Limit, trapLimitPrice, 0, TimeInForce.Gtc, uniqueOrderId, trapAtmTemplateShort, atmId, (errorCode, errorId) => { });
+                lock(listLock) { trackedAtms[atmId] = new AtmState { AtmId = atmId, EntryOrderId = uniqueOrderId, Direction = AtmDirection.Short, EntryPrice = 0, BeTriggered = false, IntendedStopPrice = trapStopLossPrice, TriggerPrice = trapTriggerPrice, SetupBarIndex = cBar, Stop1Adjusted = false, RunnerStopAdjusted = false, DisplayNotified = false, ScratchTargetPrice = 0, HasRunner = !trapNoRunnerShort, TemplateName = trapAtmTemplateShort, CreatedAt = DateTime.Now }; }
+                AtmStrategyCreate(OrderAction.Sell, OrderType.Limit, trapLimitPrice, 0, TimeInForce.Gtc, uniqueOrderId, trapAtmTemplateShort, atmId, (errorCode, errorMessage) => OnAtmCreateResult(errorCode, errorMessage, atmId, trapAtmTemplateShort));
             }
 
             lock(listLock)
@@ -1260,7 +1321,26 @@ namespace NinjaTrader.NinjaScript.Strategies
                     foreach (var kvp in trackedAtms)
                     {
                         AtmState state = kvp.Value;
-                        
+
+                        // Eine Abfrage pro Tick genuegt - vorher liefen zwei davon nebeneinander
+                        // und haben bei einer nicht existierenden ATM das Log doppelt geflutet.
+                        string[] entryStatus = state.EntryComplete ? null : GetAtmStrategyEntryOrderStatus(state.EntryOrderId);
+                        bool entryStatusValid = entryStatus != null && entryStatus.Length > 2;
+                        if (entryStatusValid) state.EntryStatusSeen = true;
+
+                        // Meldet eine ATM innerhalb des Anlauffensters nie einen Status, wurde sie
+                        // nie erzeugt - in aller Regel ein fehlendes ATM-Template. Ohne diese
+                        // Pruefung pollen wir die Phantom-ATM bis zum Bar-Timeout weiter.
+                        if (!state.EntryComplete && !entryStatusValid && !state.EntryStatusSeen
+                            && state.EntryPrice == 0 && !state.PositionSeen
+                            && (DateTime.Now - state.CreatedAt).TotalSeconds > AtmStartupGraceSeconds)
+                        {
+                            deadAtms.Add(state.AtmId);
+                            Draw.TextFixed(this, "SmartOrderError", $"ATM NEVER STARTED (template '{state.TemplateName}')\nNo entry status within {AtmStartupGraceSeconds}s - does this template exist?", TextPosition.Center, Brushes.Red, new NinjaTrader.Gui.Tools.SimpleFont("Arial", 12) { Bold = true }, Brushes.Transparent, Brushes.Transparent, 0);
+                            Print($"[{DateTime.Now.ToString("HH:mm:ss.fff")}] ATM '{state.AtmId}' never reported an entry status within {AtmStartupGraceSeconds}s (template '{state.TemplateName}') - dropping it. Most likely that ATM template does not exist.");
+                            continue;
+                        }
+
                         if (state.EntryPrice == 0)
                         {
                             if (state.TriggerPrice > 0)
@@ -1295,8 +1375,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                             }
                             // --- END BAR EXPIRATION CHECK ---
 
-                            string[] entryStatus = GetAtmStrategyEntryOrderStatus(state.EntryOrderId);
-                            if (entryStatus != null && entryStatus.Length > 2)
+                            if (entryStatusValid)
                             {
                                 string status = entryStatus[2]; 
                                 if (status == "Filled" || status == "PartFilled")
@@ -1323,14 +1402,10 @@ namespace NinjaTrader.NinjaScript.Strategies
                         // Der Runner-Bracket entsteht erst mit der letzten Entry-Execution.
                         // Solange die Entry-Order noch Fills liefern kann, fragen wir Stop2/Target2
                         // gar nicht erst ab - sonst loggt NT "Order name 'Stop2' is invalid".
-                        if (!state.EntryComplete)
+                        if (!state.EntryComplete && entryStatusValid)
                         {
-                            string[] eStatus = GetAtmStrategyEntryOrderStatus(state.EntryOrderId);
-                            if (eStatus != null && eStatus.Length > 2)
-                            {
-                                string eState = eStatus[2];
-                                if (eState == "Filled" || eState == "Cancelled" || eState == "Rejected") state.EntryComplete = true;
-                            }
+                            string eState = entryStatus[2];
+                            if (eState == "Filled" || eState == "Cancelled" || eState == "Rejected") state.EntryComplete = true;
                         }
 
                         // Teilfill: die Restmenge haengt sonst weiter im Markt und kann uns nach TP1
