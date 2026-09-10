@@ -53,6 +53,74 @@ namespace NinjaTrader.NinjaScript.Strategies
         public bool EntryStatusSeen;
     }
 
+    // ===== SIGNALBARCHECK BEGIN =====
+    // Reine Rechenlogik ohne NinjaTrader-Abhaengigkeit, damit sie sich ausserhalb
+    // der Plattform gegen echte Bars testen laesst. Die Marker-Kommentare braucht
+    // das Testprogramm, um genau diese Klasse aus der Datei zu schneiden.
+    public struct SignalBarMetrics
+    {
+        public double Range;
+        public double ClosePositionPercent;   // Close-Lage in Handelsrichtung, 100 = am Extrem
+        public double BodyPercent;            // |Close-Open| / Range
+        public double BreakoutWickPercent;    // Docht in Ausbruchsrichtung / Range
+        public bool Shaved;                   // Close auf dem Extrem (kein Ausbruchsdocht)
+    }
+
+    public static class SignalBarCheck
+    {
+        public static SignalBarMetrics Measure(bool isLong, double open, double high, double low, double close, double tickSize)
+        {
+            SignalBarMetrics m = new SignalBarMetrics();
+            m.Range = high - low;
+            if (m.Range <= 0) return m;
+
+            m.ClosePositionPercent = (isLong ? close - low : high - close) / m.Range * 100.0;
+            m.BodyPercent          = Math.Abs(close - open) / m.Range * 100.0;
+            m.BreakoutWickPercent  = (isLong ? high - close : close - low) / m.Range * 100.0;
+
+            // Schliesst die Bar auf ihrem Extrem, gibt es in Ausbruchsrichtung keinen
+            // Docht - Koerper- und Dochtpruefung sind dort gegenstandslos.
+            m.Shaved = isLong ? close >= high - tickSize / 2.0 : close <= low + tickSize / 2.0;
+            return m;
+        }
+
+        public static bool Evaluate(bool isLong,
+            double open, double high, double low, double close, double tickSize,
+            bool requireClosePosition, double closePositionPercent,
+            bool requireMinBody, double minBodyPercent,
+            bool requireNoBreakoutWick, double maxBreakoutWickPercent,
+            out string reason)
+        {
+            SignalBarMetrics m = Measure(isLong, open, high, low, close, tickSize);
+            if (m.Range <= 0)
+            {
+                reason = "Signal bar rejected: zero range";
+                return false;
+            }
+
+            List<string> failed = new List<string>();
+
+            if (requireClosePosition && m.ClosePositionPercent < closePositionPercent)
+                failed.Add($"close {m.ClosePositionPercent:0.0}% < {closePositionPercent:0.#}%");
+
+            if (requireMinBody && !m.Shaved && m.BodyPercent < minBodyPercent)
+                failed.Add($"body {m.BodyPercent:0.0}% < {minBodyPercent:0.#}%");
+
+            if (requireNoBreakoutWick && !m.Shaved && m.BreakoutWickPercent > maxBreakoutWickPercent)
+                failed.Add($"breakout wick {m.BreakoutWickPercent:0.0}% > {maxBreakoutWickPercent:0.#}%");
+
+            if (failed.Count == 0)
+            {
+                reason = "";
+                return true;
+            }
+
+            reason = "Signal bar rejected: " + string.Join(" | ", failed);
+            return false;
+        }
+    }
+    // ===== SIGNALBARCHECK END =====
+
     public class LotsenhofSniper : Strategy
     {
         // UI Elements
@@ -137,11 +205,6 @@ namespace NinjaTrader.NinjaScript.Strategies
 
         [NinjaScriptProperty]
         [Range(1, 100)]
-        [Display(Name="Min Body Ratio (%)", Description="Minimum required percentage of the candle body relative to the total candle size to filter out indecisive Dojis.", Order=7, GroupName="1. Parameters")]
-        public int MinBodyRatioPercent { get; set; }
-
-        [NinjaScriptProperty]
-        [Range(1, 100)]
         [Display(Name="Max Runway (Ticks)", Description="Cancel the unfilled limit order if price moves this many ticks past the trigger without filling.", Order=8, GroupName="1. Parameters")]
         public int MaxRunwayTicks { get; set; }
 
@@ -164,7 +227,7 @@ namespace NinjaTrader.NinjaScript.Strategies
         public bool ShowOnlySmartButtons { get; set; }
         
         [NinjaScriptProperty]
-        [Display(Name="Enable non perfect signal bars", Description="If enabled, you can enter long on a red bar and vice versa and a doji as well", Order=11, GroupName="1. Parameters")]
+        [Display(Name="Enable non perfect signal bars", Description="Master-Override fuer den Signal-Bar-Filter (Gruppe 7). true = Filter wird komplett uebersprungen, jede Bar ist handelbar. false = alle aktivierten Kriterien aus Gruppe 7 muessen bestehen.", Order=11, GroupName="1. Parameters")]
         public bool EnableTradingNonPerfectBars { get; set; }
 
         [NinjaScriptProperty]
@@ -235,6 +298,33 @@ namespace NinjaTrader.NinjaScript.Strategies
         public double MinLossToCount { get; set; }
 
         [NinjaScriptProperty]
+        [Display(Name="Require Close Position", Description="Signal-Bar muss in Handelsrichtung weit genug schliessen (siehe Close Position %).", Order=1, GroupName="7. Signal Bar Filter")]
+        public bool RequireClosePosition { get; set; }
+
+        [NinjaScriptProperty]
+        [Range(0, 100)]
+        [Display(Name="Close Position (%)", Description="Long: (Close-Low)/(High-Low), Short: (High-Close)/(High-Low) muss mindestens so gross sein.", Order=2, GroupName="7. Signal Bar Filter")]
+        public int ClosePositionPercent { get; set; }
+
+        [NinjaScriptProperty]
+        [Display(Name="Require Min Body", Description="Koerper muss mindestens Min Body Ratio % der Range haben. Entfaellt, wenn die Bar auf ihrem Extrem schliesst.", Order=3, GroupName="7. Signal Bar Filter")]
+        public bool RequireMinBody { get; set; }
+
+        [NinjaScriptProperty]
+        [Range(0, 100)]
+        [Display(Name="Min Body Ratio (%)", Description="|Close-Open|/(High-Low) muss mindestens so gross sein.", Order=4, GroupName="7. Signal Bar Filter")]
+        public int MinBodyRatioPercent { get; set; }
+
+        [NinjaScriptProperty]
+        [Display(Name="Require No Breakout Wick", Description="Docht in Ausbruchsrichtung darf hoechstens Max Breakout Wick % der Range sein. Entfaellt, wenn die Bar auf ihrem Extrem schliesst.", Order=5, GroupName="7. Signal Bar Filter")]
+        public bool RequireNoBreakoutWick { get; set; }
+
+        [NinjaScriptProperty]
+        [Range(0, 100)]
+        [Display(Name="Max Breakout Wick (%)", Description="Long: (High-Close)/(High-Low), Short: (Close-Low)/(High-Low) darf hoechstens so gross sein.", Order=6, GroupName="7. Signal Bar Filter")]
+        public int MaxBreakoutWickPercent { get; set; }
+
+        [NinjaScriptProperty]
         [Display(Name="Hotkey LONG (Smart)", Description="Key for Smart Long Entry", Order=1, GroupName="3. Hotkeys")]
         public SniperKey HotkeyLong { get; set; }
 
@@ -273,7 +363,6 @@ namespace NinjaTrader.NinjaScript.Strategies
                 MaxSlippageTicks            = 2; 
                 DefaultMaxRiskTicks         = 9; 
                 SmartOffsetTicks            = 2;
-                MinBodyRatioPercent         = 10; 
                 MaxRunwayTicks              = 10;              
                 EnableAutoBreakeven         = true;
                 EnableTradingNonPerfectBars = false;
@@ -295,6 +384,12 @@ namespace NinjaTrader.NinjaScript.Strategies
                 EnableDailyLossLockout      = true;
                 LossesUntilLockout          = 1;
                 MinLossToCount              = 0;
+                RequireClosePosition        = true;
+                ClosePositionPercent        = 70;
+                RequireMinBody              = true;
+                MinBodyRatioPercent         = 5;
+                RequireNoBreakoutWick       = true;
+                MaxBreakoutWickPercent      = 25;
 
                 HotkeyLong                  = SniperKey.W;
                 HotkeyShort                 = SniperKey.S; 
@@ -831,6 +926,33 @@ namespace NinjaTrader.NinjaScript.Strategies
             return true;
         }
 
+        #region Signal-Bar-Filter
+
+        // Gemeinsame Qualitaetspruefung der Signal-Bar (Bar[1]) fuer alle sechs
+        // Einstiege. Sitzt in den Execute-Methoden selbst und greift deshalb bei
+        // Button und Hotkey gleichermassen.
+        private bool IsValidSignalBar(bool isLong, out string reason)
+        {
+            reason = "";
+            if (EnableTradingNonPerfectBars) return true;
+
+            double o, h, l, c, tSize;
+            lock(dataLock) { o = cOpen1; h = cHigh1; l = cLow1; c = cClose1; tSize = cTickSize; }
+
+            if (SignalBarCheck.Evaluate(isLong, o, h, l, c, tSize,
+                    RequireClosePosition, ClosePositionPercent,
+                    RequireMinBody, MinBodyRatioPercent,
+                    RequireNoBreakoutWick, MaxBreakoutWickPercent,
+                    out reason))
+                return true;
+
+            Draw.TextFixed(this, "SmartOrderError", reason.Replace(" | ", "\n"), TextPosition.Center, Brushes.Red, new NinjaTrader.Gui.Tools.SimpleFont("Arial", 12) { Bold = true }, Brushes.Transparent, Brushes.Transparent, 0);
+            Print($"[{DateTime.Now.ToString("HH:mm:ss.fff")}] {(isLong ? "Long" : "Short")}: {reason} (O={o} H={h} L={l} C={c})");
+            return false;
+        }
+
+        #endregion
+
         private void ExecuteMomentumLong()
         {
             if (IsTradingBlocked()) return;
@@ -846,6 +968,9 @@ namespace NinjaTrader.NinjaScript.Strategies
                 Draw.TextFixed(this, "SmartOrderError", "ERROR: Inside Bar blocked!", TextPosition.Center, Brushes.Red, new NinjaTrader.Gui.Tools.SimpleFont("Arial", 14) { Bold = true }, Brushes.Transparent, Brushes.Transparent, 0);
                 return;
             }
+
+            string signalReason;
+            if (!IsValidSignalBar(true, out signalReason)) return;
 
             double entryPrice = h1 + tSize; 
             double limitPrice = entryPrice + (MaxSlippageTicks * tSize); 
@@ -905,6 +1030,9 @@ namespace NinjaTrader.NinjaScript.Strategies
                 return;
             }
 
+            string signalReason;
+            if (!IsValidSignalBar(false, out signalReason)) return;
+
             double entryPrice = l1 - tSize;
             double limitPrice = entryPrice - (MaxSlippageTicks * tSize); 
             double structuralStop = h1 + tSize; 
@@ -959,8 +1087,8 @@ namespace NinjaTrader.NinjaScript.Strategies
                 return;
             }
 
-            double h1, l1, h2, l2, c0, open1, close1, tSize; int bar;
-            lock(dataLock) { h1 = cHigh1; l1 = cLow1; h2 = cHigh2; l2 = cLow2; open1 = cOpen1; c0 = cClose0; close1 = cClose1; bar = cBar; tSize = cTickSize; }
+            double h1, l1, h2, l2, c0, tSize; int bar;
+            lock(dataLock) { h1 = cHigh1; l1 = cLow1; h2 = cHigh2; l2 = cLow2; c0 = cClose0; bar = cBar; tSize = cTickSize; }
             if (bar < 2) return;
             
             if (BlockInsideBars && h1 <= h2 && l1 >= l2)
@@ -975,15 +1103,8 @@ namespace NinjaTrader.NinjaScript.Strategies
             double totalStructureSize = Math.Round((h1 - Math.Min(l1, l2)) / tSize); 
 
 
-            if (!EnableTradingNonPerfectBars && close1 < ((h1 + l1) / 2)) {
-                Draw.TextFixed(this, "SmartOrderError", "ERROR: Bar did not close in the upper half!", TextPosition.Center, Brushes.Red, new NinjaTrader.Gui.Tools.SimpleFont("Arial", 14) { Bold = true }, Brushes.Transparent, Brushes.Transparent, 0);
-                return;
-            }
-
-            if (!EnableTradingNonPerfectBars && close1 < open1) {
-                Draw.TextFixed(this, "SmartOrderError", "ERROR: You are trying to go long on a red bar?", TextPosition.Center, Brushes.Red, new NinjaTrader.Gui.Tools.SimpleFont("Arial", 14) { Bold = true }, Brushes.Transparent, Brushes.Transparent, 0);
-                return;
-            }
+            string signalReason;
+            if (!IsValidSignalBar(true, out signalReason)) return;
             
             trapTriggerPrice = triggerPrice;
             trapStopLossPrice = structuralStop; 
@@ -1034,8 +1155,8 @@ namespace NinjaTrader.NinjaScript.Strategies
                 return;
             }
 
-            double h1, l1, h2, l2, c0, open1, close1, tSize; int bar;
-            lock(dataLock) { h1 = cHigh1; l1 = cLow1; h2 = cHigh2; l2 = cLow2; open1 = cOpen1; c0 = cClose0; close1 = cClose1; bar = cBar; tSize = cTickSize; }
+            double h1, l1, h2, l2, c0, tSize; int bar;
+            lock(dataLock) { h1 = cHigh1; l1 = cLow1; h2 = cHigh2; l2 = cLow2; c0 = cClose0; bar = cBar; tSize = cTickSize; }
             if (bar < 2) return;
             
             if (BlockInsideBars && h1 <= h2 && l1 >= l2)
@@ -1050,14 +1171,8 @@ namespace NinjaTrader.NinjaScript.Strategies
             double totalStructureSize = Math.Round((Math.Max(h1, h2) - l1) / tSize); 
 
 
-            if (!EnableTradingNonPerfectBars && close1 > ((h1 + l1) / 2) ) {
-                Draw.TextFixed(this, "SmartOrderError", "ERROR: Bar did not close in the lower half!", TextPosition.Center, Brushes.Red, new NinjaTrader.Gui.Tools.SimpleFont("Arial", 14) { Bold = true }, Brushes.Transparent, Brushes.Transparent, 0);
-                return;
-            }
-            if (!EnableTradingNonPerfectBars && close1 > open1) {
-                Draw.TextFixed(this, "SmartOrderError", "ERROR: You are trying to go short on a green bar?", TextPosition.Center, Brushes.Red, new NinjaTrader.Gui.Tools.SimpleFont("Arial", 14) { Bold = true }, Brushes.Transparent, Brushes.Transparent, 0);
-                return;
-            }
+            string signalReason;
+            if (!IsValidSignalBar(false, out signalReason)) return;
             
             trapTriggerPrice = triggerPrice;
             trapStopLossPrice = structuralStop; 
@@ -1111,6 +1226,9 @@ namespace NinjaTrader.NinjaScript.Strategies
                 return;
             }
 
+            string signalReason;
+            if (!IsValidSignalBar(true, out signalReason)) return;
+
             double structuralStop = l1 - tSize;
             double triggerPrice = h1 + tSize;
             double candleSize = Math.Round((h1 - l1) / tSize);
@@ -1158,6 +1276,9 @@ namespace NinjaTrader.NinjaScript.Strategies
                 Draw.TextFixed(this, "SmartOrderError", "ERROR: Inside Bar blocked!", TextPosition.Center, Brushes.Red, new NinjaTrader.Gui.Tools.SimpleFont("Arial", 14) { Bold = true }, Brushes.Transparent, Brushes.Transparent, 0);
                 return;
             }
+
+            string signalReason;
+            if (!IsValidSignalBar(false, out signalReason)) return;
 
             double structuralStop = h1 + tSize;
             double triggerPrice = l1 - tSize;
