@@ -1229,7 +1229,8 @@ namespace NinjaTrader.NinjaScript.Strategies
             string signalReason;
             if (!IsValidSignalBar(true, out signalReason)) return;
 
-            double structuralStop = l1 - tSize;
+            // Gleiche Stop-Basis wie Smart: liegt Bar 2 tiefer, zaehlt deren Tief.
+            double structuralStop = Math.Min(l1, l2) - tSize;
             double triggerPrice = h1 + tSize;
             double candleSize = Math.Round((h1 - l1) / tSize);
 
@@ -1280,7 +1281,8 @@ namespace NinjaTrader.NinjaScript.Strategies
             string signalReason;
             if (!IsValidSignalBar(false, out signalReason)) return;
 
-            double structuralStop = h1 + tSize;
+            // Gleiche Stop-Basis wie Smart: liegt Bar 2 hoeher, zaehlt deren Hoch.
+            double structuralStop = Math.Max(h1, h2) + tSize;
             double triggerPrice = l1 - tSize;
             double candleSize = Math.Round((h1 - l1) / tSize);
 
