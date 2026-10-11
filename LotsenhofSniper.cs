@@ -51,6 +51,11 @@ namespace NinjaTrader.NinjaScript.Strategies
         public string TemplateName;
         public DateTime CreatedAt;
         public bool EntryStatusSeen;
+        public bool T1Filled;          // Target1 gefuellt -> Runner-Trail darf laufen
+        public DateTime FlatSince;     // Entry gefuellt, aber ATM meldet noch keine Position (Live-Verzoegerung)
+        public double PostFillExtreme; // bester Kurs SEIT dem Fill (Long: hoechster, Short: tiefster) - fuer den Teilfill-Cancel
+        public bool EntryPartial;      // Entry endete "Cancelled" mit Teilfill -> evtl. kein Runner-Bracket
+        public bool RunnerProbed;      // Stop2 nach Teilfill einmal geprueft
     }
 
     // ===== SIGNALBARCHECK BEGIN =====
@@ -91,6 +96,24 @@ namespace NinjaTrader.NinjaScript.Strategies
             bool requireNoBreakoutWick, double maxBreakoutWickPercent,
             out string reason)
         {
+            return Evaluate(isLong, open, high, low, close, tickSize,
+                requireClosePosition, closePositionPercent,
+                requireMinBody, minBodyPercent,
+                requireNoBreakoutWick, maxBreakoutWickPercent,
+                false, 90, 10, out reason);
+        }
+
+        // Rejection Bar (Hand-Regel 5 seit 20.09.2026): Close sehr nah am Extrem in
+        // Handelsrichtung und kaum Docht in Ausbruchsrichtung -> Koerper egal. Typisch:
+        // langer Ablehnungsdocht auf der Gegenseite, Close 1 Tick neben dem Extrem.
+        public static bool Evaluate(bool isLong,
+            double open, double high, double low, double close, double tickSize,
+            bool requireClosePosition, double closePositionPercent,
+            bool requireMinBody, double minBodyPercent,
+            bool requireNoBreakoutWick, double maxBreakoutWickPercent,
+            bool allowRejectionBar, double rejectionMinClosePercent, double rejectionMaxWickPercent,
+            out string reason)
+        {
             SignalBarMetrics m = Measure(isLong, open, high, low, close, tickSize);
             if (m.Range <= 0)
             {
@@ -100,13 +123,18 @@ namespace NinjaTrader.NinjaScript.Strategies
 
             List<string> failed = new List<string>();
 
+            bool rejection = allowRejectionBar
+                && m.ClosePositionPercent >= rejectionMinClosePercent
+                && m.BreakoutWickPercent <= rejectionMaxWickPercent;
+            bool exempt = m.Shaved || rejection;
+
             if (requireClosePosition && m.ClosePositionPercent < closePositionPercent)
                 failed.Add($"close {m.ClosePositionPercent:0.0}% < {closePositionPercent:0.#}%");
 
-            if (requireMinBody && !m.Shaved && m.BodyPercent < minBodyPercent)
+            if (requireMinBody && !exempt && m.BodyPercent < minBodyPercent)
                 failed.Add($"body {m.BodyPercent:0.0}% < {minBodyPercent:0.#}%");
 
-            if (requireNoBreakoutWick && !m.Shaved && m.BreakoutWickPercent > maxBreakoutWickPercent)
+            if (requireNoBreakoutWick && !exempt && m.BreakoutWickPercent > maxBreakoutWickPercent)
                 failed.Add($"breakout wick {m.BreakoutWickPercent:0.0}% > {maxBreakoutWickPercent:0.#}%");
 
             if (failed.Count == 0)
@@ -136,6 +164,8 @@ namespace NinjaTrader.NinjaScript.Strategies
         private Button noRunnerSellButton;
         private Button scratchButton;
         private Button cancelButton;
+        private CheckBox climaxCheckBox;
+        private TextBlock climaxLabel;
         private Grid myGrid;
         
         // ATM State Machine
@@ -167,6 +197,10 @@ namespace NinjaTrader.NinjaScript.Strategies
         // bevor wir sie als nie entstanden verwerfen.
         private const double AtmStartupGraceSeconds = 5.0;
 
+        // So lange darf eine gefuellte Entry ohne gemeldete ATM-Position bleiben,
+        // bevor wir sie als (sofort wieder) geschlossen betrachten.
+        private const double PositionConfirmGraceSeconds = 10.0;
+
         // Revenge-Trading-Sperre
         private NinjaTrader.Data.SessionIterator lockoutSession;
         private Account lockoutAccount;
@@ -174,7 +208,42 @@ namespace NinjaTrader.NinjaScript.Strategies
         private DateTime lockoutTradingDay = DateTime.MinValue;
         private int lossesToday = 0;
         private bool tradingLocked = false;
-        
+        // Sperre wirkt nur, wenn aktiviert UND (bei "Live Accounts Only") kein Playback-/Sim-Konto.
+        private bool lockoutActive = false;
+
+        // NT meldet pro geschlossenem Teil einer Position ein eigenes Trade-Objekt
+        // (WADES: Stop1/Target1-OCO x2 + Stop2/Target2 = bis zu 3 Trades pro Position).
+        // Deshalb wird pro Entry-Order gesammelt und erst die Netto-P&L der ganzen
+        // Position als ein Verlust gezaehlt.
+        private class PositionResult
+        {
+            public string Key;
+            public string InstrumentName;
+            public int ExpectedQty;      // gefuellte Menge der Entry-Order, 0 = unbekannt
+            public int ClosedQty;
+            public double Pnl;
+            public int Parts;
+            public DateTime LastUpdate;  // Wanduhr, nur fuer die Settle-Wartezeit
+            public bool Finalized;
+            public bool CountedAsLoss;
+        }
+        private readonly Dictionary<string, PositionResult> positionResults = new Dictionary<string, PositionResult>();
+        // Wartezeit nach dem letzten Teil-Trade, bevor eine flache Position ohne
+        // bekannte Soll-Menge abgeschlossen wird.
+        private const double PositionSettleSeconds = 3.0;
+
+        // Climax-Pause (Brooks TBTL: Ten Bars, Two Legs). Nach einem Climax wird die
+        // Mit-Trend-Richtung gesperrt, bis genug Bars und Beine seit dem Extrem gelaufen sind.
+        private bool climaxActive = false;
+        private bool climaxIsBuy = true;        // true = Buy Climax (Hoch) -> Longs gesperrt
+        private int climaxAnchorBar = -1;       // absoluter Bar-Index des Extrems
+        private double climaxExtreme = 0;
+        private int climaxLegs = 1;
+        private bool climaxInLeg = true;
+        private bool climaxBreakoutPending = false;  // kraeftiger Ausbruchsbar ueber/unter dem Extrem, wartet auf Folgebar
+        private double climaxBreakoutClose = 0;
+        private bool climaxResumed = false;
+
         [NinjaScriptProperty]
         [Display(Name="ATM Strategies List", Description="Comma separated list of ATM templates", Order=1, GroupName="1. Parameters")]
         public string AtmTemplatesList { get; set; }
@@ -288,6 +357,10 @@ namespace NinjaTrader.NinjaScript.Strategies
         public bool EnableDailyLossLockout { get; set; }
 
         [NinjaScriptProperty]
+        [Display(Name="Lockout Live Accounts Only", Description="True: Auf Playback- und Sim-Konten (Name beginnt mit 'Playback' oder 'Sim') ist die Sperre automatisch aus. Echtgeld-Konten bleiben geschuetzt.", Order=4, GroupName="6. Risk Lockout")]
+        public bool LockoutLiveAccountsOnly { get; set; }
+
+        [NinjaScriptProperty]
         [Range(1, 20)]
         [Display(Name="Losses Until Lockout", Description="Anzahl Verlust-Trades auf dem Konto, nach denen gesperrt wird.", Order=2, GroupName="6. Risk Lockout")]
         public int LossesUntilLockout { get; set; }
@@ -323,6 +396,49 @@ namespace NinjaTrader.NinjaScript.Strategies
         [Range(0, 100)]
         [Display(Name="Max Breakout Wick (%)", Description="Long: (High-Close)/(High-Low), Short: (Close-Low)/(High-Low) darf hoechstens so gross sein.", Order=6, GroupName="7. Signal Bar Filter")]
         public int MaxBreakoutWickPercent { get; set; }
+
+        [NinjaScriptProperty]
+        [Display(Name="Allow Rejection Bar", Description="Hand-Regel 5: Bei Close-Position >= Rejection Min Close und Ausbruchsdocht <= Rejection Max Wick entfaellt die Koerper-Pruefung (z.B. Pin Bar mit Close 1 Tick neben dem Extrem).", Order=7, GroupName="7. Signal Bar Filter")]
+        public bool AllowRejectionBar { get; set; }
+
+        [NinjaScriptProperty]
+        [Range(0, 100)]
+        [Display(Name="Rejection Min Close (%)", Description="Mindest-Close-Position in Handelsrichtung fuer die Rejection-Bar-Ausnahme.", Order=8, GroupName="7. Signal Bar Filter")]
+        public int RejectionMinClosePercent { get; set; }
+
+        [NinjaScriptProperty]
+        [Range(0, 100)]
+        [Display(Name="Rejection Max Wick (%)", Description="Hoechster Docht in Ausbruchsrichtung fuer die Rejection-Bar-Ausnahme.", Order=9, GroupName="7. Signal Bar Filter")]
+        public int RejectionMaxWickPercent { get; set; }
+
+        [NinjaScriptProperty]
+        [Range(1, 100)]
+        [Display(Name="TBTL Min Bars", Description="Geschlossene Bars seit dem Climax-Extrem (inkl. Signal Bar), bevor die Mit-Trend-Richtung wieder frei ist.", Order=1, GroupName="8. Climax (TBTL)")]
+        public int TbtlMinBars { get; set; }
+
+        [NinjaScriptProperty]
+        [Range(1, 10)]
+        [Display(Name="TBTL Min Legs", Description="Anzahl Korrekturbeine seit dem Extrem. Neues Bein = nach einem Bar mit hoeherem Hoch (Buy Climax) ein Bar mit tieferem Tief; Short spiegelbildlich.", Order=2, GroupName="8. Climax (TBTL)")]
+        public int TbtlMinLegs { get; set; }
+
+        [NinjaScriptProperty]
+        [Range(3, 200)]
+        [Display(Name="Climax Lookback Bars", Description="Beim Anklicken wird in so vielen geschlossenen Bars das juengste Extrem (Hoch oder Tief) als Climax gesucht.", Order=3, GroupName="8. Climax (TBTL)")]
+        public int ClimaxLookbackBars { get; set; }
+
+        [NinjaScriptProperty]
+        [Display(Name="Enable Trend Resume", Description="Pause endet vorzeitig, wenn der Trend nach dem Climax bestaetigt weiterlaeuft: kraeftiger Bar schliesst ueber (Short: unter) dem Climax-Extrem und der Folgebar schliesst noch hoeher (tiefer). Jedes andere neue Extrem startet die Zaehlung neu.", Order=4, GroupName="8. Climax (TBTL)")]
+        public bool EnableTrendResume { get; set; }
+
+        [NinjaScriptProperty]
+        [Range(0, 100)]
+        [Display(Name="Resume Min Body (%)", Description="Mindestkoerper des Ausbruchsbars in Prozent seiner Range.", Order=5, GroupName="8. Climax (TBTL)")]
+        public int ResumeMinBodyPercent { get; set; }
+
+        [NinjaScriptProperty]
+        [Range(0, 100)]
+        [Display(Name="Resume Min Close Position (%)", Description="Close des Ausbruchsbars in Trendrichtung, in Prozent der Range (Long: (Close-Low)/(High-Low)).", Order=6, GroupName="8. Climax (TBTL)")]
+        public int ResumeMinClosePercent { get; set; }
 
         [NinjaScriptProperty]
         [Display(Name="Hotkey LONG (Smart)", Description="Key for Smart Long Entry", Order=1, GroupName="3. Hotkeys")]
@@ -382,6 +498,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 MinSwingSizeTicks           = 8;  // pivot must protrude at least 2 points on ES
                 TrailBufferTicks            = 1;
                 EnableDailyLossLockout      = true;
+                LockoutLiveAccountsOnly     = true;
                 LossesUntilLockout          = 1;
                 MinLossToCount              = 0;
                 RequireClosePosition        = true;
@@ -389,7 +506,16 @@ namespace NinjaTrader.NinjaScript.Strategies
                 RequireMinBody              = true;
                 MinBodyRatioPercent         = 5;
                 RequireNoBreakoutWick       = true;
+                TbtlMinBars                 = 10;
+                TbtlMinLegs                 = 2;
+                ClimaxLookbackBars          = 20;
+                EnableTrendResume           = true;
+                ResumeMinBodyPercent        = 50;
+                ResumeMinClosePercent       = 70;
                 MaxBreakoutWickPercent      = 25;
+                AllowRejectionBar           = true;
+                RejectionMinClosePercent    = 90;
+                RejectionMaxWickPercent     = 10;
 
                 HotkeyLong                  = SniperKey.W;
                 HotkeyShort                 = SniperKey.S; 
@@ -433,10 +559,14 @@ namespace NinjaTrader.NinjaScript.Strategies
             {
                 // Erst hier steht das gewaehlte Konto sicher zur Verfuegung.
                 lockoutAccount = Account;
+                bool simAccount = IsSimulationAccount(lockoutAccount);
+                lockoutActive = EnableDailyLossLockout && !(LockoutLiveAccountsOnly && simAccount);
                 if (lockoutAccount != null) lockoutAccount.AddTrade += OnAccountAddTrade;
-                else if (EnableDailyLossLockout) Print($"[{DateTime.Now.ToString("HH:mm:ss.fff")}] WARNING: no account attached, daily loss lockout is inactive.");
+                else if (lockoutActive) Print($"[{DateTime.Now.ToString("HH:mm:ss.fff")}] WARNING: no account attached, daily loss lockout is inactive.");
                 RefreshTradingDay(true);
-                if (EnableDailyLossLockout)
+                if (EnableDailyLossLockout && !lockoutActive)
+                    Print($"[{DateTime.Now.ToString("HH:mm:ss.fff")}] Loss lockout OFF for {AccountLabel()} (Playback/Sim account, 'Lockout Live Accounts Only' = True).");
+                if (lockoutActive)
                     Print($"[{DateTime.Now.ToString("HH:mm:ss.fff")}] Loss lockout armed for {AccountLabel()}, trading day {lockoutTradingDay:yyyy-MM-dd}, locked: {tradingLocked}. File: {lockoutFilePath}");
             }
             else if (State == State.Terminated)
@@ -467,7 +597,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 Margin = new Thickness(0, 30, 10, 0)
             };
 
-            for(int i=0; i<10; i++) myGrid.RowDefinitions.Add(new RowDefinition());
+            for(int i=0; i<12; i++) myGrid.RowDefinitions.Add(new RowDefinition());
             // Spalte 0 = Standard-ATM (mit Runner), Spalte 1 = No-Runner-Variante.
             for(int i=0; i<2; i++) myGrid.ColumnDefinitions.Add(new ColumnDefinition());
 
@@ -564,6 +694,35 @@ namespace NinjaTrader.NinjaScript.Strategies
             Grid.SetRow(lockoutLabel, 9);
             Grid.SetColumnSpan(lockoutLabel, 2);
 
+            climaxCheckBox = new CheckBox
+            {
+                Content = "CLIMAX (TBTL)",
+                Foreground = Brushes.White,
+                Background = Brushes.DimGray,
+                FontWeight = FontWeights.Bold,
+                Margin = new Thickness(4, 4, 2, 2),
+                VerticalContentAlignment = VerticalAlignment.Center
+            };
+            climaxCheckBox.Checked   += (o, e) => TriggerCustomEvent(state => StartClimax(), null);
+            climaxCheckBox.Unchecked += (o, e) => TriggerCustomEvent(state => StopClimax("unchecked"), null);
+            Grid.SetRow(climaxCheckBox, 10);
+            Grid.SetColumnSpan(climaxCheckBox, 2);
+
+            climaxLabel = new TextBlock
+            {
+                Text = "",
+                Foreground = Brushes.Black,
+                Background = Brushes.Orange,
+                FontWeight = FontWeights.Bold,
+                TextAlignment = TextAlignment.Center,
+                TextWrapping = TextWrapping.Wrap,
+                Margin = new Thickness(2),
+                Padding = new Thickness(6, 4, 6, 4),
+                Visibility = Visibility.Collapsed
+            };
+            Grid.SetRow(climaxLabel, 11);
+            Grid.SetColumnSpan(climaxLabel, 2);
+
             myGrid.Children.Add(atmToggleButton);
             myGrid.Children.Add(buyButton);
             myGrid.Children.Add(sellButton);
@@ -578,6 +737,8 @@ namespace NinjaTrader.NinjaScript.Strategies
             myGrid.Children.Add(scratchButton);
             myGrid.Children.Add(cancelButton);
             myGrid.Children.Add(lockoutLabel);
+            myGrid.Children.Add(climaxCheckBox);
+            myGrid.Children.Add(climaxLabel);
             
             UserControlCollection.Add(myGrid);
 
@@ -651,28 +812,342 @@ namespace NinjaTrader.NinjaScript.Strategies
             Print($"[{DateTime.Now.ToString("HH:mm:ss.fff")}] AtmStrategyCreate failed for template '{templateName}': {detail}. Tracking for {atmId} dropped.");
         }
 
-        #region Revenge-Trading-Sperre
+        #region Climax-Pause (TBTL)
 
-        // Laeuft auf dem Account-Thread. Hier nur filtern, alles Weitere wandert
-        // ueber TriggerCustomEvent auf den Strategie-Thread.
-        private void OnAccountAddTrade(object sender, AddTradeEventArgs e)
+        // Wird per Checkbox gestartet (Strategie-Thread via TriggerCustomEvent).
+        // Sucht das juengste Extrem der letzten ClimaxLookbackBars geschlossenen Bars
+        // und spielt alle Bars danach nach, damit auch ein spaeter Klick korrekt zaehlt.
+        private void StartClimax()
         {
-            if (!EnableDailyLossLockout || e == null || e.Trade == null) return;
+            if (CurrentBar < 3) { StopClimax("not enough bars"); return; }
 
-            double pnl = e.Trade.ProfitCurrency;
-            if (pnl >= 0) return;
-            if (MinLossToCount > 0 && -pnl < MinLossToCount) return;
+            int lookback = Math.Min(ClimaxLookbackBars, CurrentBar - 1);
+            int hiAgo = 1, loAgo = 1;
+            for (int b = 1; b <= lookback; b++)
+            {
+                if (High[b] > High[hiAgo]) hiAgo = b;
+                if (Low[b] < Low[loAgo]) loAgo = b;
+            }
 
-            TriggerCustomEvent(o => RegisterLoss(pnl), null);
+            bool isBuy;
+            if (hiAgo != loAgo) isBuy = hiAgo < loAgo;          // juengeres Extrem gewinnt
+            else isBuy = Close[hiAgo] >= Open[hiAgo];            // Outside Bar: Richtung des Bars
+
+            climaxIsBuy = isBuy;
+            climaxResumed = false;
+            int anchorAgo = isBuy ? hiAgo : loAgo;
+            ResetClimaxAnchor(CurrentBar - anchorAgo, isBuy ? High[anchorAgo] : Low[anchorAgo]);
+            climaxActive = true;
+
+            // Ein bereits scharfer Mit-Trend-Trap wuerde die Pause sonst unterlaufen.
+            if (isBuy && trapLongActive)  { trapLongActive = false;  RemoveDrawObject("TrapTrigger"); RemoveDrawObject("TrapLimit"); }
+            if (!isBuy && trapShortActive) { trapShortActive = false; RemoveDrawObject("TrapTrigger"); RemoveDrawObject("TrapLimit"); }
+
+            for (int b = anchorAgo - 1; b >= 1; b--) ProcessClimaxBar(b);
+
+            Print($"[{DateTime.Now.ToString("HH:mm:ss.fff")}] Climax started: {(isBuy ? "BUY climax (high)" : "SELL climax (low)")} {climaxExtreme} at {Time[CurrentBar - climaxAnchorBar]:HH:mm:ss}. {(isBuy ? "Longs" : "Shorts")} blocked until {TbtlMinBars} bars / {TbtlMinLegs} legs.");
+            CheckClimaxRelease();
         }
 
-        private void RegisterLoss(double pnl)
+        private void StopClimax(string reason)
+        {
+            // Nach "released" feuert das programmatische Abhaken erneut - dann nichts tun,
+            // damit "TBTL OK" sichtbar bleibt.
+            if (!climaxActive && reason == "unchecked") return;
+            bool wasActive = climaxActive;
+            climaxActive = false;
+            RemoveDrawObject("ClimaxMark");
+            if (wasActive) Print($"[{DateTime.Now.ToString("HH:mm:ss.fff")}] Climax pause ended ({reason}).");
+            UpdateClimaxUi(reason == "released" ? "TBTL OK" : reason == "resumed" ? "TREND RESUMED" : "");
+
+            if (ChartControl != null && climaxCheckBox != null)
+                ChartControl.Dispatcher.InvokeAsync(() => { if (climaxCheckBox.IsChecked == true) climaxCheckBox.IsChecked = false; });
+        }
+
+        private void ResetClimaxAnchor(int anchorBar, double extreme)
+        {
+            climaxAnchorBar = anchorBar;
+            climaxExtreme = extreme;
+            climaxLegs = 1;
+            climaxInLeg = true;
+            climaxBreakoutPending = false;
+        }
+
+        // Ein geschlossener Bar (barsAgo >= 1). Buy Climax:
+        // - Folgebar nach kraeftigem Ausbruch schliesst hoeher -> Trend laeuft weiter (Pause endet)
+        // - neues Hoch -> Zaehlung startet neu; war es ein kraeftiger Ausbruchsbar mit Close
+        //   ueber dem alten Extrem, wird auf die Folgebar gewartet
+        // - im Bein: Bar mit hoeherem Hoch als der Vorbar = Gegenbewegung, Bein beendet
+        // - in der Gegenbewegung: Bar mit tieferem Tief als der Vorbar = neues Bein
+        // Sell Climax spiegelbildlich.
+        private void ProcessClimaxBar(int barsAgo)
+        {
+            if (climaxResumed) return;
+
+            double o = Open[barsAgo], h = High[barsAgo], l = Low[barsAgo], c = Close[barsAgo];
+            double ph = High[barsAgo + 1], pl = Low[barsAgo + 1];
+
+            if (climaxBreakoutPending)
+            {
+                climaxBreakoutPending = false;
+                bool follow = climaxIsBuy ? c > climaxBreakoutClose : c < climaxBreakoutClose;
+                if (follow)
+                {
+                    climaxResumed = true;
+                    Print($"[{DateTime.Now.ToString("HH:mm:ss.fff")}] Climax: follow-through bar {Time[barsAgo]:HH:mm:ss} closed {c} beyond breakout close {climaxBreakoutClose} - trend resumed.");
+                    return;
+                }
+            }
+
+            if (climaxIsBuy)
+            {
+                if (h > climaxExtreme)
+                {
+                    double oldExtreme = climaxExtreme;
+                    ResetClimaxAnchor(CurrentBar - barsAgo, h);
+                    if (EnableTrendResume && c > oldExtreme && c > o && IsStrongResumeBar(o, h, l, c, true))
+                    {
+                        climaxBreakoutPending = true;
+                        climaxBreakoutClose = c;
+                    }
+                    return;
+                }
+                if (climaxInLeg) { if (h > ph) climaxInLeg = false; }
+                else if (l < pl) { climaxInLeg = true; climaxLegs++; }
+            }
+            else
+            {
+                if (l < climaxExtreme)
+                {
+                    double oldExtreme = climaxExtreme;
+                    ResetClimaxAnchor(CurrentBar - barsAgo, l);
+                    if (EnableTrendResume && c < oldExtreme && c < o && IsStrongResumeBar(o, h, l, c, false))
+                    {
+                        climaxBreakoutPending = true;
+                        climaxBreakoutClose = c;
+                    }
+                    return;
+                }
+                if (climaxInLeg) { if (l < pl) climaxInLeg = false; }
+                else if (h > ph) { climaxInLeg = true; climaxLegs++; }
+            }
+        }
+
+        private bool IsStrongResumeBar(double o, double h, double l, double c, bool isLong)
+        {
+            double range = h - l;
+            if (range <= 0) return false;
+            double bodyPct = Math.Abs(c - o) / range * 100.0;
+            double closePct = (isLong ? (c - l) : (h - c)) / range * 100.0;
+            return bodyPct >= ResumeMinBodyPercent && closePct >= ResumeMinClosePercent;
+        }
+
+        private int ClimaxBarsSince()
+        {
+            // Geschlossene Bars nach dem Extrem, der letzte (= Signal Bar) eingeschlossen.
+            return Math.Max(0, (CurrentBar - 1) - climaxAnchorBar);
+        }
+
+        private void UpdateClimax()
+        {
+            if (!climaxActive || CurrentBar < 3) return;
+            int before = climaxAnchorBar;
+            ProcessClimaxBar(1);
+            if (climaxAnchorBar != before)
+                Print($"[{DateTime.Now.ToString("HH:mm:ss.fff")}] Climax extended: new {(climaxIsBuy ? "high" : "low")} {climaxExtreme} - TBTL count restarts.");
+            CheckClimaxRelease();
+        }
+
+        private void CheckClimaxRelease()
+        {
+            if (!climaxActive) return;
+
+            int bars = ClimaxBarsSince();
+            int barsAgo = CurrentBar - climaxAnchorBar;
+            if (barsAgo >= 0 && barsAgo <= CurrentBar)
+            {
+                double y = climaxIsBuy ? climaxExtreme + 2 * TickSize : climaxExtreme - 2 * TickSize;
+                Draw.Text(this, "ClimaxMark", "C", barsAgo, y, Brushes.Orange);
+            }
+
+            if (climaxResumed)
+            {
+                Print($"[{DateTime.Now.ToString("HH:mm:ss.fff")}] TREND RESUMED after climax - {(climaxIsBuy ? "Longs" : "Shorts")} released. Entry still needs a valid setup.");
+                StopClimax("resumed");
+                return;
+            }
+
+            if (bars >= TbtlMinBars && climaxLegs >= TbtlMinLegs)
+            {
+                Print($"[{DateTime.Now.ToString("HH:mm:ss.fff")}] TBTL complete: {bars} bars, {climaxLegs} legs since {climaxExtreme}. {(climaxIsBuy ? "Longs" : "Shorts")} released.");
+                StopClimax("released");
+                return;
+            }
+            UpdateClimaxUi();
+        }
+
+        private bool IsClimaxBlocked(AtmDirection dir)
+        {
+            if (!climaxActive) return false;
+            bool withTrend = (climaxIsBuy && dir == AtmDirection.Long) || (!climaxIsBuy && dir == AtmDirection.Short);
+            if (!withTrend) return false;
+
+            string msg = $"BLOCKED: climax pause (TBTL) - {ClimaxBarsSince()}/{TbtlMinBars} bars, {Math.Min(climaxLegs, TbtlMinLegs)}/{TbtlMinLegs} legs since {climaxExtreme}.";
+            Draw.TextFixed(this, "SmartOrderError", msg, TextPosition.Center, Brushes.Orange, new NinjaTrader.Gui.Tools.SimpleFont("Arial", 14) { Bold = true }, Brushes.Transparent, Brushes.Transparent, 0);
+            Print($"[{DateTime.Now.ToString("HH:mm:ss.fff")}] Entry {dir} blocked: {msg}");
+            return true;
+        }
+
+        private void UpdateClimaxUi(string overrideText = null)
+        {
+            if (ChartControl == null) return;
+
+            bool active = climaxActive;
+            string text = overrideText;
+            if (text == null && active)
+                text = $"{(climaxIsBuy ? "BUY CLIMAX " : "SELL CLIMAX ")}{climaxExtreme}\n{(climaxIsBuy ? "Long" : "Short")} gesperrt: {ClimaxBarsSince()}/{TbtlMinBars} Bars, {Math.Min(climaxLegs, TbtlMinLegs)}/{TbtlMinLegs} Legs";
+            bool ok = overrideText == "TBTL OK" || overrideText == "TREND RESUMED";
+
+            ChartControl.Dispatcher.InvokeAsync(() =>
+            {
+                if (climaxLabel == null) return;
+                climaxLabel.Text = text ?? "";
+                climaxLabel.Background = ok ? Brushes.LimeGreen : Brushes.Orange;
+                climaxLabel.Visibility = string.IsNullOrEmpty(text) ? Visibility.Collapsed : Visibility.Visible;
+            });
+        }
+
+        #endregion
+
+        #region Revenge-Trading-Sperre
+
+        // Laeuft auf dem Account-Thread. Hier nur die Daten abgreifen, alles Weitere
+        // wandert ueber TriggerCustomEvent auf den Strategie-Thread.
+        // Gewinner-Teile werden NICHT mehr verworfen: T1-Gewinn + Runner-Verlust
+        // ergibt netto einen Gewinn und darf nicht als Verlust zaehlen.
+        private void OnAccountAddTrade(object sender, AddTradeEventArgs e)
+        {
+            if (!lockoutActive || e == null || e.Trade == null) return;
+
+            NinjaTrader.Cbi.Trade t = e.Trade;
+            double pnl = t.ProfitCurrency;
+            int qty = t.Quantity;
+            NinjaTrader.Cbi.Execution entry = t.Entry;
+
+            string key = null;
+            int expected = 0;
+            string instrument = "";
+            if (entry != null)
+            {
+                key = !string.IsNullOrEmpty(entry.OrderId) ? entry.OrderId : entry.ExecutionId;
+                if (entry.Order != null) expected = entry.Order.Filled;
+                if (entry.Instrument != null) instrument = entry.Instrument.FullName;
+            }
+
+            TriggerCustomEvent(o => CollectTradePart(key, instrument, qty, expected, pnl), null);
+        }
+
+        private void CollectTradePart(string key, string instrument, int qty, int expected, double pnl)
+        {
+            RefreshTradingDay();
+
+            // Ohne Entry-Zuordnung bleibt nur das alte Verhalten: Teil = Position.
+            if (string.IsNullOrEmpty(key))
+            {
+                if (IsCountableLoss(pnl)) RegisterLoss(pnl, 1);
+                return;
+            }
+
+            PositionResult r;
+            if (!positionResults.TryGetValue(key, out r))
+            {
+                r = new PositionResult { Key = key, InstrumentName = instrument };
+                positionResults[key] = r;
+            }
+
+            r.ClosedQty += qty;
+            r.Pnl += pnl;
+            r.Parts++;
+            r.LastUpdate = DateTime.Now;
+            if (expected > r.ExpectedQty) r.ExpectedQty = expected;
+
+            if (r.Finalized)
+            {
+                // Nachzuegler nach dem Abschluss: nur neu bewerten, wenn die Position
+                // bisher nicht als Verlust gezaehlt wurde - nie doppelt zaehlen.
+                if (!r.CountedAsLoss) FinalizePosition(r, "late part");
+                return;
+            }
+
+            if (r.ExpectedQty > 0 && r.ClosedQty >= r.ExpectedQty)
+                FinalizePosition(r, "all parts closed");
+            else
+                SettlePositions(false);
+        }
+
+        // Schliesst offene Sammlungen ab, deren Instrument auf dem Konto flat ist.
+        // force = true: ohne Wartezeit (vor einem neuen Entry).
+        private void SettlePositions(bool force)
+        {
+            if (positionResults.Count == 0) return;
+
+            DateTime now = DateTime.Now;
+            foreach (PositionResult r in new List<PositionResult>(positionResults.Values))
+            {
+                if (r.Finalized) continue;
+                if (!force && (now - r.LastUpdate).TotalSeconds < PositionSettleSeconds) continue;
+                if (!IsAccountFlat(r.InstrumentName)) continue;
+                FinalizePosition(r, force ? "flat before new entry" : "position flat");
+            }
+        }
+
+        private void FinalizePosition(PositionResult r, string reason)
+        {
+            r.Finalized = true;
+            Print($"[{DateTime.Now.ToString("HH:mm:ss.fff")}] Position closed on {AccountLabel()} ({reason}): {r.Parts} part(s), {r.ClosedQty} contract(s), net {r.Pnl:0.00}.");
+
+            if (!IsCountableLoss(r.Pnl)) return;
+
+            r.CountedAsLoss = true;
+            RegisterLoss(r.Pnl, r.Parts);
+        }
+
+        private bool IsCountableLoss(double pnl)
+        {
+            if (pnl >= 0) return false;
+            if (MinLossToCount > 0 && -pnl < MinLossToCount) return false;
+            return true;
+        }
+
+        private bool IsAccountFlat(string instrumentName)
+        {
+            if (lockoutAccount == null || string.IsNullOrEmpty(instrumentName)) return true;
+            try
+            {
+                lock (lockoutAccount.Positions)
+                {
+                    foreach (NinjaTrader.Cbi.Position p in lockoutAccount.Positions)
+                    {
+                        if (p == null || p.Instrument == null) continue;
+                        if (p.Instrument.FullName != instrumentName) continue;
+                        if (p.MarketPosition != MarketPosition.Flat && p.Quantity > 0) return false;
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Print($"[{DateTime.Now.ToString("HH:mm:ss.fff")}] Position check failed ({ex.Message}), treating as flat.");
+            }
+            return true;
+        }
+
+        private void RegisterLoss(double pnl, int parts)
         {
             RefreshTradingDay();
             if (tradingLocked) return;
 
             lossesToday++;
-            Print($"[{DateTime.Now.ToString("HH:mm:ss.fff")}] Loss registered on {AccountLabel()}: {pnl:0.00} ({lossesToday}/{LossesUntilLockout}).");
+            Print($"[{DateTime.Now.ToString("HH:mm:ss.fff")}] Loss registered on {AccountLabel()}: {pnl:0.00} from {parts} part(s) ({lossesToday}/{LossesUntilLockout}).");
 
             if (lossesToday >= LossesUntilLockout) ApplyLockout();
         }
@@ -699,18 +1174,22 @@ namespace NinjaTrader.NinjaScript.Strategies
         {
             // Faellt der Session-Kalender aus, ist der Kalendertag immer noch
             // besser als gar keine Sperre.
-            DateTime day = DateTime.Today;
+            // Globals.Now = Wanduhr live, Playback-Zeit im Playback. So gehoert ein
+            // Backtest-Verlust zum simulierten Handelstag und nicht zum echten Datum.
+            DateTime now = NinjaTrader.Core.Globals.Now;
+            DateTime day = now.Date;
             if (lockoutSession != null)
             {
-                try { day = lockoutSession.GetTradingDay(DateTime.Now).Date; }
-                catch { day = DateTime.Today; }
+                try { day = lockoutSession.GetTradingDay(now).Date; }
+                catch { day = now.Date; }
             }
 
             if (day == lockoutTradingDay && !force) return;
 
             lockoutTradingDay = day;
             lossesToday = 0;
-            tradingLocked = IsLockoutPersisted(day);
+            positionResults.Clear();
+            tradingLocked = lockoutActive && IsLockoutPersisted(day);
             UpdateLockoutUi();
 
             if (tradingLocked)
@@ -719,14 +1198,24 @@ namespace NinjaTrader.NinjaScript.Strategies
 
         private bool IsTradingBlocked()
         {
-            if (!EnableDailyLossLockout) return false;
+            if (!lockoutActive) return false;
 
             RefreshTradingDay();
+            // Eine eben geschlossene Position muss vor dem naechsten Entry gezaehlt sein.
+            SettlePositions(true);
             if (!tradingLocked) return false;
 
             Draw.TextFixed(this, "SmartOrderError", $"BLOCKED: daily loss lockout active on {AccountLabel()}.\nNo new entries until the next trading day.", TextPosition.Center, Brushes.Red, new NinjaTrader.Gui.Tools.SimpleFont("Arial", 14) { Bold = true }, Brushes.Transparent, Brushes.Transparent, 0);
             Print($"[{DateTime.Now.ToString("HH:mm:ss.fff")}] Entry blocked: daily loss lockout active on {AccountLabel()} for {lockoutTradingDay:yyyy-MM-dd}.");
             return true;
+        }
+
+        private static bool IsSimulationAccount(Account acc)
+        {
+            if (acc == null || string.IsNullOrEmpty(acc.Name)) return false;
+            string n = acc.Name;
+            return n.StartsWith("Playback", StringComparison.OrdinalIgnoreCase)
+                || n.StartsWith("Sim", StringComparison.OrdinalIgnoreCase);
         }
 
         private string AccountLabel()
@@ -841,7 +1330,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             {
                 foreach (var kvp in trackedAtms)
                 {
-                    AtmStrategyCancelEntryOrder(kvp.Key);
+                    AtmStrategyCancelEntryOrder(kvp.Value.EntryOrderId);
                     AtmStrategyClose(kvp.Key); 
                 }
                 trackedAtms.Clear();
@@ -943,6 +1432,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                     RequireClosePosition, ClosePositionPercent,
                     RequireMinBody, MinBodyRatioPercent,
                     RequireNoBreakoutWick, MaxBreakoutWickPercent,
+                    AllowRejectionBar, RejectionMinClosePercent, RejectionMaxWickPercent,
                     out reason))
                 return true;
 
@@ -956,6 +1446,7 @@ namespace NinjaTrader.NinjaScript.Strategies
         private void ExecuteMomentumLong()
         {
             if (IsTradingBlocked()) return;
+            if (IsClimaxBlocked(AtmDirection.Long)) return;
 
             RemoveDrawObject("SmartOrderError");
             double h1, l1, h2, l2, c0, tSize; int bar;
@@ -1017,6 +1508,7 @@ namespace NinjaTrader.NinjaScript.Strategies
         private void ExecuteMomentumShort()
         {
             if (IsTradingBlocked()) return;
+            if (IsClimaxBlocked(AtmDirection.Short)) return;
 
             RemoveDrawObject("SmartOrderError");
             double h1, l1, h2, l2, c0, tSize; int bar;
@@ -1078,6 +1570,7 @@ namespace NinjaTrader.NinjaScript.Strategies
         private void ExecuteSmartLong(bool noRunner = false)
         {
             if (IsTradingBlocked()) return;
+            if (IsClimaxBlocked(AtmDirection.Long)) return;
 
             // Ohne Suffix wuerde der No-Runner-Button das normale Template feuern,
             // die Runner-Verwaltung aber trotzdem abschalten.
@@ -1146,6 +1639,7 @@ namespace NinjaTrader.NinjaScript.Strategies
         private void ExecuteSmartShort(bool noRunner = false)
         {
             if (IsTradingBlocked()) return;
+            if (IsClimaxBlocked(AtmDirection.Short)) return;
 
             // Ohne Suffix wuerde der No-Runner-Button das normale Template feuern,
             // die Runner-Verwaltung aber trotzdem abschalten.
@@ -1215,6 +1709,7 @@ namespace NinjaTrader.NinjaScript.Strategies
         private void ExecuteDeepSmartLong()
         {
             if (IsTradingBlocked()) return;
+            if (IsClimaxBlocked(AtmDirection.Long)) return;
 
             double h1, l1, h2, l2, c0, tSize; int bar;
             lock(dataLock) { h1 = cHigh1; l1 = cLow1; h2 = cHigh2; l2 = cLow2; c0 = cClose0; bar = cBar; tSize = cTickSize; }
@@ -1267,6 +1762,7 @@ namespace NinjaTrader.NinjaScript.Strategies
         private void ExecuteDeepSmartShort()
         {
             if (IsTradingBlocked()) return;
+            if (IsClimaxBlocked(AtmDirection.Short)) return;
 
             double h1, l1, h2, l2, c0, tSize; int bar;
             lock(dataLock) { h1 = cHigh1; l1 = cLow1; h2 = cHigh2; l2 = cLow2; c0 = cClose0; bar = cBar; tSize = cTickSize; }
@@ -1396,7 +1892,8 @@ namespace NinjaTrader.NinjaScript.Strategies
             if (CurrentBar < 2) return; 
 
             bool isNewBar = IsFirstTickOfBar;
-            if (isNewBar && EnableDailyLossLockout && State == State.Realtime) RefreshTradingDay();
+            if (isNewBar && lockoutActive && State == State.Realtime) { RefreshTradingDay(); SettlePositions(false); }
+            if (isNewBar && climaxActive) UpdateClimax();
 
             lock(dataLock)
             {
@@ -1471,7 +1968,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                                 if (state.Direction == AtmDirection.Long && High[0] >= state.TriggerPrice + (MaxRunwayTicks * cTickSize))
                                 {
                                     Print($"[{DateTime.Now.ToString("HH:mm:ss.fff")}] Smart Long EXPIRED: Price ran {MaxRunwayTicks} Ticks past trigger. Cancelling Limit Order.");
-                                    AtmStrategyCancelEntryOrder(state.AtmId);
+                                    AtmStrategyCancelEntryOrder(state.EntryOrderId);
                                     AtmStrategyClose(state.AtmId);
                                     deadAtms.Add(state.AtmId);
                                     continue;
@@ -1479,7 +1976,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                                 else if (state.Direction == AtmDirection.Short && Low[0] <= state.TriggerPrice - (MaxRunwayTicks * cTickSize))
                                 {
                                     Print($"[{DateTime.Now.ToString("HH:mm:ss.fff")}] Smart Short EXPIRED: Price ran {MaxRunwayTicks} Ticks past trigger. Cancelling Limit Order.");
-                                    AtmStrategyCancelEntryOrder(state.AtmId);
+                                    AtmStrategyCancelEntryOrder(state.EntryOrderId);
                                     AtmStrategyClose(state.AtmId);
                                     deadAtms.Add(state.AtmId);
                                     continue;
@@ -1491,7 +1988,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                             if (cBar >= state.SetupBarIndex + maxBarsToWait)
                             {
                                 Print($"[{DateTime.Now.ToString("HH:mm:ss.fff")}] Smart Order EXPIRED: Allowed bars exceeded (Current: {cBar}, Setup: {state.SetupBarIndex}, Allowed: {maxBarsToWait}). Cancelling Live Order.");
-                                AtmStrategyCancelEntryOrder(state.AtmId);
+                                AtmStrategyCancelEntryOrder(state.EntryOrderId);
                                 AtmStrategyClose(state.AtmId);
                                 deadAtms.Add(state.AtmId);
                                 continue;
@@ -1507,6 +2004,10 @@ namespace NinjaTrader.NinjaScript.Strategies
                                     if (double.TryParse(entryStatus[0], System.Globalization.NumberStyles.Any, System.Globalization.CultureInfo.InvariantCulture, out parsedPrice)) 
                                     {
                                         state.EntryPrice = parsedPrice;
+                                        // Der Lauf fuer den Teilfill-Cancel zaehlt erst AB dem Fill. High/Low des
+                                        // laufenden Bars enthalten sonst die Bewegung VOR dem Fill (Bug 17.12.2025:
+                                        // Restmenge wurde eine Sekunde nach dem Fill storniert).
+                                        state.PostFillExtreme = parsedPrice;
                                     }
                                 }
                             }
@@ -1518,8 +2019,30 @@ namespace NinjaTrader.NinjaScript.Strategies
                         if (atmQty > 0) state.PositionSeen = true;
                         if (state.PositionSeen && atmQty == 0)
                         {
+                            // Position ist zu (Stop/Target), aber eine Restmenge der Entry-Order kann
+                            // noch im Markt haengen -> sonst wirft sie uns spaeter erneut in eine Position.
+                            if (!state.EntryComplete && !state.EntryCancelRequested)
+                            {
+                                state.EntryCancelRequested = true;
+                                AtmStrategyCancelEntryOrder(state.EntryOrderId);
+                                Print($"[{DateTime.Now.ToString("HH:mm:ss.fff")}] Position flat, remaining entry quantity cancelled ({state.EntryOrderId}).");
+                            }
                             deadAtms.Add(state.AtmId);
                             continue;
+                        }
+
+                        // Teilfill: die ATM verteilt Brackets je Ausfuehrung. Fehlt nach dem Cancel der
+                        // Restmenge das Runner-Bracket (Stop2), behandeln wir die Position als No-Runner,
+                        // sonst schreibt jeder Tick "Order name 'Stop2' is invalid" ins Log.
+                        if (state.EntryPartial && state.HasRunner && !state.RunnerProbed)
+                        {
+                            state.RunnerProbed = true;
+                            string[,] probe = GetAtmStrategyStopTargetOrderStatus(RunnerStopName, state.AtmId);
+                            if (probe == null || probe.GetLength(0) == 0)
+                            {
+                                state.HasRunner = false;
+                                Print($"[{DateTime.Now.ToString("HH:mm:ss.fff")}] Partial fill: no runner bracket ({RunnerStopName}) on this position - managing it as no-runner (Target1/Stop1 only).");
+                            }
                         }
 
                         // Der Runner-Bracket entsteht erst mit der letzten Entry-Execution.
@@ -1529,6 +2052,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                         {
                             string eState = entryStatus[2];
                             if (eState == "Filled" || eState == "Cancelled" || eState == "Rejected") state.EntryComplete = true;
+                            if (eState == "Cancelled" && state.EntryPrice != 0) state.EntryPartial = true;
                         }
 
                         // Teilfill: die Restmenge haengt sonst weiter im Markt und kann uns nach TP1
@@ -1536,20 +2060,25 @@ namespace NinjaTrader.NinjaScript.Strategies
                         // Profitrichtung weggelaufen, fuellt sie ohnehin nicht mehr sauber -> stornieren.
                         if (!state.EntryComplete && !state.EntryCancelRequested && state.EntryPrice != 0)
                         {
+                            // Nur der Weg seit dem Fill zaehlt: Close[0] ist bei Calculate=OnPriceChange der letzte Kurs.
+                            if (state.PostFillExtreme == 0) state.PostFillExtreme = state.EntryPrice;
+                            state.PostFillExtreme = state.Direction == AtmDirection.Long
+                                ? Math.Max(state.PostFillExtreme, Close[0])
+                                : Math.Min(state.PostFillExtreme, Close[0]);
                             double runTicks = state.Direction == AtmDirection.Long
-                                ? (High[0] - state.EntryPrice) / cTickSize
-                                : (state.EntryPrice - Low[0]) / cTickSize;
+                                ? (state.PostFillExtreme - state.EntryPrice) / cTickSize
+                                : (state.EntryPrice - state.PostFillExtreme) / cTickSize;
 
                             if (runTicks >= PartialFillCancelTicks)
                             {
                                 state.EntryCancelRequested = true;
-                                AtmStrategyCancelEntryOrder(state.AtmId);
+                                AtmStrategyCancelEntryOrder(state.EntryOrderId);
                                 Draw.TextFixed(this, "PartialFill_Notice", $"PARTIAL FILL: rest of entry cancelled ({PartialFillCancelTicks} ticks run)", TextPosition.TopRight, Brushes.Orange, new NinjaTrader.Gui.Tools.SimpleFont("Arial", 12) { Bold = true }, Brushes.Transparent, Brushes.Transparent, 0);
                                 Print($"[{DateTime.Now.ToString("HH:mm:ss.fff")}] Partial fill: cancelling remaining entry quantity, price ran {Math.Floor(runTicks)} ticks past entry {state.EntryPrice}.");
                             }
                         }
 
-                        if (state.EntryPrice != 0 && state.IntendedStopPrice > 0)
+                        if (state.EntryPrice != 0 && state.PositionSeen && state.IntendedStopPrice > 0)
                         {
                             if (!state.Stop1Adjusted)
                             {
@@ -1591,7 +2120,7 @@ namespace NinjaTrader.NinjaScript.Strategies
 
                         // Ohne Runner schliesst Target1 die komplette Position, ein BE-Stop
                         // waere also gegenstandslos.
-                        if (EnableAutoBreakeven && state.HasRunner && state.EntryPrice != 0 && !state.BeTriggered)
+                        if (EnableAutoBreakeven && state.HasRunner && state.EntryPrice != 0 && state.PositionSeen && !state.BeTriggered)
                         {
                             string[,] t1Status = GetAtmStrategyStopTargetOrderStatus(Target1Name, state.AtmId);
                             if (t1Status != null && t1Status.GetLength(0) > 0 && t1Status.GetLength(1) > 2)
@@ -1616,13 +2145,39 @@ namespace NinjaTrader.NinjaScript.Strategies
                             }
                         }
 
-                        if (EnableRunnerTrail && state.BeTriggered && isNewBar)
+                        // Der Trail startet, sobald Target1 gefuellt ist - UNABHAENGIG vom
+                        // Auto-Breakeven. Vorher hing er an state.BeTriggered, das nur der
+                        // BE-Block setzt: Mit EnableAutoBreakeven = false lief der Trail nie
+                        // und der Runner blieb bis zum Schluss auf dem Initial-Stop.
+                        if (EnableRunnerTrail && state.HasRunner && state.EntryPrice != 0 && state.PositionSeen && !state.T1Filled)
+                        {
+                            string[,] t1Trail = GetAtmStrategyStopTargetOrderStatus(Target1Name, state.AtmId);
+                            if (t1Trail != null && t1Trail.GetLength(0) > 0 && t1Trail.GetLength(1) > 2
+                                && t1Trail[0, 2] == "Filled")
+                            {
+                                state.T1Filled = true;
+                            }
+                        }
+
+                        if (EnableRunnerTrail && (state.BeTriggered || state.T1Filled) && isNewBar)
                         {
                             ManageRunnerTrail(state);
                         }
 
                         // Fallback fuer den Fall, dass Fill und Close auf denselben Tick fallen.
-                        if (state.EntryPrice != 0 && atmQty == 0) deadAtms.Add(state.AtmId);
+                        // LIVE-BUG 24.09.2026: Beim Broker meldet die Entry-Order "Filled", bevor die
+                        // ATM-Position aktualisiert ist (Menge noch 0). Ohne Wartezeit wurde die ATM im
+                        // selben Durchlauf verworfen -> kein Struktur-Stop, kein Scratch, kein BE/Trail.
+                        // Deshalb erst nach PositionConfirmGraceSeconds ohne Position aufgeben.
+                        if (state.EntryPrice != 0 && atmQty == 0 && !state.PositionSeen)
+                        {
+                            if (state.FlatSince == DateTime.MinValue) state.FlatSince = DateTime.Now;
+                            else if ((DateTime.Now - state.FlatSince).TotalSeconds > PositionConfirmGraceSeconds)
+                            {
+                                Print($"[{DateTime.Now.ToString("HH:mm:ss.fff")}] ATM '{state.AtmId}': entry filled but no position for {PositionConfirmGraceSeconds}s - treating as closed.");
+                                deadAtms.Add(state.AtmId);
+                            }
+                        }
                     }
                     
                     foreach(string id in deadAtms) 
