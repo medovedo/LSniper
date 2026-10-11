@@ -56,6 +56,42 @@ namespace NinjaTrader.NinjaScript.Strategies
         public double PostFillExtreme; // bester Kurs SEIT dem Fill (Long: hoechster, Short: tiefster) - fuer den Teilfill-Cancel
         public bool EntryPartial;      // Entry endete "Cancelled" mit Teilfill -> evtl. kein Runner-Bracket
         public bool RunnerProbed;      // Stop2 nach Teilfill einmal geprueft
+        public bool Surprised;         // Box "SURPRISED" war beim Oeffnen der Position angehakt
+        public DateTime OpenedAt;      // Bar-Zeit beim Oeffnen der Position (Trade-Log)
+        // Trade-Log (gleiche Spalten wie das Trade-Log des ChartTraders)
+        public TradeLogInfo Log;                                                     // Daten beim Scharfmachen
+        public List<LogFill> EntryFills = new List<LogFill>();
+        public List<LogFill> ExitFills = new List<LogFill>();
+        public Dictionary<string, double> OrderPrices = new Dictionary<string, double>();    // letzter Preis je ATM-Order
+        public Dictionary<string, double> ExpectedPrices = new Dictionary<string, double>(); // eigene Aenderungen (kein "manual")
+        public List<string> ManualChanges = new List<string>();
+        public bool Closed;
+        public DateTime ClosedSeen;
+    }
+
+    // Daten des Setups fuer das Trade-Log (beim Scharfmachen erfasst, Bar[1] = Signal-Bar, Bar[2] = Vorbar).
+    public class TradeLogInfo
+    {
+        public string Setup = "";              // z. B. "Smart Long", "Smart Long (No Runner)", "Momentum Short"
+        public string EntryType = "Manual";    // Direct / PullbackLimit
+        public DateTime SignalStart = DateTime.MinValue;
+        public double SigO = double.NaN, SigH = double.NaN, SigL = double.NaN, SigC = double.NaN;
+        public double PrevH = double.NaN, PrevL = double.NaN;
+        public double Trigger = double.NaN, Limit = double.NaN, InitialSL = double.NaN;
+        public int MaxRisk;
+        public double DistEma = double.NaN;    // Close der Signal-Bar minus EMA, Punkte
+        public double T1Price = double.NaN, T2Price = double.NaN;   // geplante Targets (erster Preis nach dem Fill)
+    }
+
+    public class LogFill
+    {
+        public double Price;
+        public int Qty;
+        public DateTime Time;
+        public string Name = "";               // Order-Name der ATM (Entry, Target1, Stop1, Stop2, ...)
+        public bool IsStop;
+        public double StopPrice;
+        public bool IsLong;                    // Kauf-Ausfuehrung
     }
 
     // ===== SIGNALBARCHECK BEGIN =====
@@ -165,6 +201,8 @@ namespace NinjaTrader.NinjaScript.Strategies
         private Button scratchButton;
         private Button cancelButton;
         private CheckBox climaxCheckBox;
+        private CheckBox surprisedCheckBox;
+        private bool surprisedArmed;   // Box angehakt: die naechste Position, die oeffnet, uebernimmt es (dann geleert)
         private TextBlock climaxLabel;
         private Grid myGrid;
         
@@ -205,6 +243,19 @@ namespace NinjaTrader.NinjaScript.Strategies
         private NinjaTrader.Data.SessionIterator lockoutSession;
         private Account lockoutAccount;
         private string lockoutFilePath = "";
+        private string tradeLogPath = "";   // LotsenhofSniper_trades.csv: eine Zeile je geschlossenem ATM-Trade
+        private const string TradeLogHeader = "Replayed;Date;Open;Close;Instrument;Setup;Side;Qty;Entry;Exit;Points;Ticks;PnL;Duration;"
+            + "SignalBarStart;SignalO;SignalH;SignalL;SignalC;PrevBarH;PrevBarL;Trigger;EntryType;LimitPrice;InitialSL;RiskTicks;"
+            + "Template;MaxRiskTicks;T1Price;T2Price;ExitT1;ExitT1Time;ExitRunner;ExitRunnerTime;RunnerExitReason;ManualChanges;"
+            + "DistEMA;Surprised";
+        private const int JournalEmaPeriod = 21;           // DistEMA wie im ChartTrader (EMA 21 der Chart-Bars)
+        private const double LogSettleSeconds = 5.0;       // so lange auf fehlende Ausfuehrungen warten
+        private Account logAccount;
+        private string logRunStarted = "";
+        private List<AtmState> pendingLogs = new List<AtmState>();   // geschlossen, Zeile noch nicht geschrieben
+        private TradeLogInfo trapLogLong, trapLogShort;
+        private DateTime cSignalStart;
+        private double cEma1;
         private DateTime lockoutTradingDay = DateTime.MinValue;
         private int lossesToday = 0;
         private bool tradingLocked = false;
@@ -563,6 +614,11 @@ namespace NinjaTrader.NinjaScript.Strategies
                 lockoutActive = EnableDailyLossLockout && !(LockoutLiveAccountsOnly && simAccount);
                 if (lockoutAccount != null) lockoutAccount.AddTrade += OnAccountAddTrade;
                 else if (lockoutActive) Print($"[{DateTime.Now.ToString("HH:mm:ss.fff")}] WARNING: no account attached, daily loss lockout is inactive.");
+                // Trade-Log: Ausfuehrungen und Order-Aenderungen der ATM-Orders mitlesen.
+                logAccount = Account;
+                logRunStarted = DateTime.Now.ToString("yyyy-MM-dd HH:mm");
+                if (logAccount != null) { logAccount.ExecutionUpdate += OnLogExecutionUpdate; logAccount.OrderUpdate += OnLogOrderUpdate; }
+                SelectTradeLogPath();
                 RefreshTradingDay(true);
                 if (EnableDailyLossLockout && !lockoutActive)
                     Print($"[{DateTime.Now.ToString("HH:mm:ss.fff")}] Loss lockout OFF for {AccountLabel()} (Playback/Sim account, 'Lockout Live Accounts Only' = True).");
@@ -584,6 +640,8 @@ namespace NinjaTrader.NinjaScript.Strategies
                 RemoveDrawObject("PartialFill_Notice");
                 RemoveDrawObject("Trail_Notice");
                 if (lockoutAccount != null) { lockoutAccount.AddTrade -= OnAccountAddTrade; lockoutAccount = null; }
+                if (logAccount != null) { logAccount.ExecutionUpdate -= OnLogExecutionUpdate; logAccount.OrderUpdate -= OnLogOrderUpdate; logAccount = null; }
+                TryFlushLogs(true);
                 lock(listLock) { trackedAtms.Clear(); }
             }
         }
@@ -597,7 +655,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 Margin = new Thickness(0, 30, 10, 0)
             };
 
-            for(int i=0; i<12; i++) myGrid.RowDefinitions.Add(new RowDefinition());
+            for(int i=0; i<13; i++) myGrid.RowDefinitions.Add(new RowDefinition());
             // Spalte 0 = Standard-ATM (mit Runner), Spalte 1 = No-Runner-Variante.
             for(int i=0; i<2; i++) myGrid.ColumnDefinitions.Add(new ColumnDefinition());
 
@@ -723,6 +781,23 @@ namespace NinjaTrader.NinjaScript.Strategies
             Grid.SetRow(climaxLabel, 11);
             Grid.SetColumnSpan(climaxLabel, 2);
 
+            // SURPRISED: vor dem Trade anhaken. Die Position uebernimmt es beim Oeffnen (Output-Fenster),
+            // danach wird die Box geleert; spaeter angehakt zaehlt fuer den naechsten Trade.
+            // Handeln geht auch ohne.
+            surprisedCheckBox = new CheckBox
+            {
+                Content = "SURPRISED (before the trade)",
+                Foreground = Brushes.White,
+                Background = Brushes.DimGray,
+                FontWeight = FontWeights.Bold,
+                Margin = new Thickness(4, 4, 2, 2),
+                VerticalContentAlignment = VerticalAlignment.Center
+            };
+            surprisedCheckBox.Checked   += (o, e) => TriggerCustomEvent(state => SetSurprised(true), null);
+            surprisedCheckBox.Unchecked += (o, e) => TriggerCustomEvent(state => SetSurprised(false), null);
+            Grid.SetRow(surprisedCheckBox, 12);
+            Grid.SetColumnSpan(surprisedCheckBox, 2);
+
             myGrid.Children.Add(atmToggleButton);
             myGrid.Children.Add(buyButton);
             myGrid.Children.Add(sellButton);
@@ -739,6 +814,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             myGrid.Children.Add(lockoutLabel);
             myGrid.Children.Add(climaxCheckBox);
             myGrid.Children.Add(climaxLabel);
+            myGrid.Children.Add(surprisedCheckBox);
             
             UserControlCollection.Add(myGrid);
 
@@ -996,6 +1072,284 @@ namespace NinjaTrader.NinjaScript.Strategies
             Draw.TextFixed(this, "SmartOrderError", msg, TextPosition.Center, Brushes.Orange, new NinjaTrader.Gui.Tools.SimpleFont("Arial", 14) { Bold = true }, Brushes.Transparent, Brushes.Transparent, 0);
             Print($"[{DateTime.Now.ToString("HH:mm:ss.fff")}] Entry {dir} blocked: {msg}");
             return true;
+        }
+
+        // Strategie-Thread (TriggerCustomEvent aus der Box).
+        private void SetSurprised(bool on)
+        {
+            if (surprisedArmed == on) return;
+            surprisedArmed = on;
+            if (!on) return;
+            bool inTrade = false;
+            lock(listLock) { foreach (AtmState st in trackedAtms.Values) if (st.PositionSeen) { inTrade = true; break; } }
+            if (inTrade)
+                Print($"[{DateTime.Now.ToString("HH:mm:ss.fff")}] Surprised: counts for the next trade (the open position was entered without it).");
+        }
+
+        #region Trade-Log (gleiche Spalten und Formate wie journal/trade_log.csv des ChartTraders)
+
+        // Excel auf deutschem System: ';', Dezimalkomma, UTF-8 mit BOM, CRLF. Die Datei wird nur angehaengt (Live-Daten
+        // gehen nie verloren); "Replayed" = Start dieser Strategie-Instanz. Datei mit anderem Kopf -> *_v2.csv.
+        private void SelectTradeLogPath()
+        {
+            string dir = NinjaTrader.Core.Globals.UserDataDir;
+            tradeLogPath = System.IO.Path.Combine(dir, "LotsenhofSniper_trades.csv");
+            try
+            {
+                if (System.IO.File.Exists(tradeLogPath))
+                {
+                    string first;
+                    using (System.IO.StreamReader r = new System.IO.StreamReader(tradeLogPath, true)) first = r.ReadLine();
+                    if (first != TradeLogHeader) tradeLogPath = System.IO.Path.Combine(dir, "LotsenhofSniper_trades_v2.csv");
+                }
+            }
+            catch (Exception) { }
+        }
+
+        private TradeLogInfo MakeLogInfo(string setup, double trigger, double limit, double stop)
+        {
+            TradeLogInfo i = new TradeLogInfo { Setup = setup, Trigger = trigger, InitialSL = stop, MaxRisk = MaxRiskTicks };
+            bool pullback = !double.IsNaN(limit) && Math.Abs(limit - trigger) > TickSize / 2;
+            i.EntryType = pullback ? "PullbackLimit" : "Direct";
+            i.Limit = pullback ? limit : double.NaN;
+            lock(dataLock)
+            {
+                i.SignalStart = cSignalStart;
+                i.SigO = cOpen1; i.SigH = cHigh1; i.SigL = cLow1; i.SigC = cClose1;
+                i.PrevH = cHigh2; i.PrevL = cLow2;
+                i.DistEma = cClose1 - cEma1;
+            }
+            return i;
+        }
+
+        // Eigene Aenderungen an Stops/Targets (Initial-Stop, Auto-BE, Trail, Scratch) zaehlen nicht als "ManualChanges".
+        private void ChangeStopTargetLogged(double limitPrice, double stopPrice, string orderName, string atmId)
+        {
+            AtmState st;
+            lock(listLock) { trackedAtms.TryGetValue(atmId, out st); }
+            if (st != null && !string.IsNullOrEmpty(orderName)) st.ExpectedPrices[orderName] = limitPrice > 0 ? limitPrice : stopPrice;
+            AtmStrategyChangeStopTarget(limitPrice, stopPrice, orderName, atmId);
+        }
+
+        private bool IsOurInstrument(NinjaTrader.Cbi.Instrument inst)
+        {
+            return inst != null && Instrument != null && inst.FullName == Instrument.FullName;
+        }
+
+        // Account-Thread: Werte kopieren, Verarbeitung auf dem Strategie-Thread.
+        private void OnLogExecutionUpdate(object sender, ExecutionEventArgs e)
+        {
+            if (e == null || e.Execution == null || !IsOurInstrument(e.Execution.Instrument)) return;
+            NinjaTrader.Cbi.Execution ex = e.Execution;
+            NinjaTrader.Cbi.Order o = ex.Order;
+            LogFill f = new LogFill
+            {
+                Price = ex.Price, Qty = ex.Quantity, Time = ex.Time,
+                Name = (o != null ? o.Name : ex.Name) ?? "",
+                IsStop = o != null && (o.OrderType == OrderType.StopMarket || o.OrderType == OrderType.StopLimit),
+                StopPrice = o != null ? o.StopPrice : 0,
+                IsLong = ex.MarketPosition == MarketPosition.Long
+            };
+            TriggerCustomEvent(x => AddLogFill(f), null);
+        }
+
+        private void OnLogOrderUpdate(object sender, OrderEventArgs e)
+        {
+            if (e == null || e.Order == null || !IsOurInstrument(e.Order.Instrument)) return;
+            if (e.OrderState != OrderState.Accepted && e.OrderState != OrderState.Working) return;
+            string name = e.Order.Name ?? "";
+            if (name == "" || name == "Entry") return;
+            bool isStop = e.Order.OrderType == OrderType.StopMarket || e.Order.OrderType == OrderType.StopLimit;
+            double price = isStop ? e.StopPrice : e.LimitPrice;
+            if (price <= 0) return;
+            TriggerCustomEvent(x => TrackOrderPrice(name, isStop, price), null);
+        }
+
+        private List<AtmState> LogCandidates()
+        {
+            List<AtmState> all = new List<AtmState>();
+            lock(listLock) { all.AddRange(trackedAtms.Values); }
+            foreach (AtmState st in pendingLogs) if (!all.Contains(st)) all.Add(st);
+            return all;
+        }
+
+        private static int SumQty(List<LogFill> fills) { int q = 0; foreach (LogFill f in fills) q += f.Qty; return q; }
+
+        private static double AvgPrice(List<LogFill> fills)
+        {
+            double pq = 0; int q = 0;
+            foreach (LogFill f in fills) { pq += f.Price * f.Qty; q += f.Qty; }
+            return q > 0 ? pq / q : double.NaN;
+        }
+
+        // Zuordnung ohne ATM-ID an der Ausfuehrung: zuerst Exit (aelteste ATM der Gegenrichtung mit offenen
+        // Kontrakten), sonst Entry (juengste offene ATM gleicher Richtung).
+        private void AddLogFill(LogFill f)
+        {
+            AtmState target = null;
+            foreach (AtmState st in LogCandidates())
+            {
+                bool stLong = st.Direction == AtmDirection.Long;
+                if (f.IsLong != stLong && SumQty(st.EntryFills) > SumQty(st.ExitFills)
+                    && (target == null || st.CreatedAt < target.CreatedAt)) target = st;
+            }
+            if (target != null) target.ExitFills.Add(f);
+            else
+            {
+                foreach (AtmState st in LogCandidates())
+                {
+                    bool stLong = st.Direction == AtmDirection.Long;
+                    if (f.IsLong == stLong && !st.Closed && (target == null || st.CreatedAt > target.CreatedAt)) target = st;
+                }
+                if (target == null) return;
+                target.EntryFills.Add(f);
+            }
+            TryFlushLogs(false);
+        }
+
+        private void TrackOrderPrice(string name, bool isStop, double price)
+        {
+            AtmState st = null;
+            foreach (AtmState c in LogCandidates())
+                if (!c.Closed && (st == null || c.CreatedAt > st.CreatedAt)) st = c;
+            if (st == null) return;
+
+            double old;
+            if (!st.OrderPrices.TryGetValue(name, out old))
+            {
+                st.OrderPrices[name] = price;
+                if (st.Log != null && name == Target1Name && double.IsNaN(st.Log.T1Price)) st.Log.T1Price = price;
+                if (st.Log != null && name == RunnerTargetName && double.IsNaN(st.Log.T2Price)) st.Log.T2Price = price;
+                return;
+            }
+            if (Math.Abs(price - old) < TickSize / 2) return;
+            st.OrderPrices[name] = price;
+
+            double expected;
+            if (st.ExpectedPrices.TryGetValue(name, out expected) && Math.Abs(expected - price) < TickSize / 2)
+            {
+                st.ExpectedPrices.Remove(name);
+                return;
+            }
+            double entry = SumQty(st.EntryFills) > 0 ? AvgPrice(st.EntryFills) : st.EntryPrice;
+            string newText = isStop && entry > 0 && Math.Abs(price - entry) < TickSize ? "BE" : Px(price);
+            st.ManualChanges.Add($"{name} {Px(old)}->{newText}");
+        }
+
+        private void TryFlushLogs(bool force)
+        {
+            for (int i = pendingLogs.Count - 1; i >= 0; i--)
+            {
+                AtmState st = pendingLogs[i];
+                int inQty = SumQty(st.EntryFills), outQty = SumQty(st.ExitFills);
+                bool complete = inQty > 0 && outQty >= inQty;
+                if (!force && !complete && (DateTime.Now - st.ClosedSeen).TotalSeconds < LogSettleSeconds) continue;
+                pendingLogs.RemoveAt(i);
+                WriteTradeLog(st);
+            }
+        }
+
+        private static readonly System.Globalization.CultureInfo LogCulture = new System.Globalization.CultureInfo("de-DE");
+
+        // Preis wie im ChartTrader: zwei Nachkommastellen, Dezimalkomma; NaN = leer.
+        private static string Px(double x) { return double.IsNaN(x) ? "" : x.ToString("0.00", LogCulture); }
+
+        // Zahl ohne ueberfluessige Nullen (ChartTrader _num).
+        private static string Num(double x)
+        {
+            if (double.IsNaN(x)) return "";
+            string t = x.ToString("0.##########", LogCulture);
+            return t == "-0" ? "0" : t;
+        }
+
+        private static string Hms(DateTime t) { return t == DateTime.MinValue ? "" : t.ToString("HH:mm:ss"); }
+
+        // ES 06-25 -> ESM5 (wie die Instrument-Spalte des ChartTraders)
+        private string LogSymbol()
+        {
+            if (Instrument == null) return "";
+            try
+            {
+                if (Instrument.MasterInstrument.InstrumentType == InstrumentType.Future && Instrument.Expiry.Year > 2000)
+                    return Instrument.MasterInstrument.Name + "FGHJKMNQUVXZ"[Instrument.Expiry.Month - 1] + (Instrument.Expiry.Year % 10);
+            }
+            catch (Exception) { }
+            return Instrument.FullName;
+        }
+
+        private void WriteTradeLog(AtmState st)
+        {
+            if (string.IsNullOrEmpty(tradeLogPath)) return;
+            try
+            {
+                TradeLogInfo info = st.Log ?? new TradeLogInfo();
+                int sign = st.Direction == AtmDirection.Long ? 1 : -1;
+                int qty = SumQty(st.EntryFills);
+                double entry = qty > 0 ? AvgPrice(st.EntryFills) : st.EntryPrice;
+                double exit = AvgPrice(st.ExitFills);
+                DateTime opened = st.EntryFills.Count > 0 ? st.EntryFills[0].Time : st.OpenedAt;
+                DateTime closed = st.ExitFills.Count > 0 ? st.ExitFills[st.ExitFills.Count - 1].Time : opened;
+                double points = double.IsNaN(exit) ? double.NaN : Math.Round((exit - entry) * sign, 2);
+                double pnl = double.NaN;
+                if (!double.IsNaN(exit))
+                {
+                    pnl = 0;
+                    foreach (LogFill f in st.ExitFills) pnl += (f.Price - entry) * f.Qty * sign;
+                    pnl = Math.Round(pnl * Instrument.MasterInstrument.PointValue, 2);
+                }
+                TimeSpan dur = closed - opened;
+                if (dur < TimeSpan.Zero) dur = TimeSpan.Zero;
+
+                List<LogFill> t1 = new List<LogFill>(), rest = new List<LogFill>();
+                foreach (LogFill f in st.ExitFills) { if (f.Name == Target1Name && !f.IsStop) t1.Add(f); else rest.Add(f); }
+                string reason = "";
+                if (st.ExitFills.Count > 0)
+                {
+                    LogFill last = st.ExitFills[st.ExitFills.Count - 1];
+                    if (last.IsStop) reason = Math.Abs(last.StopPrice - entry) < TickSize ? "BE" : "Stop";
+                    else if (last.Name.StartsWith("Target")) reason = "Target";
+                    else reason = "Manual";
+                }
+
+                string[] cols =
+                {
+                    logRunStarted,
+                    opened == DateTime.MinValue ? "" : opened.ToString("yyyy-MM-dd"), Hms(opened), Hms(closed),
+                    LogSymbol(), (info.Setup + " " + st.TemplateName).Trim(), sign > 0 ? "LONG" : "SHORT", qty.ToString(),
+                    Num(entry), double.IsNaN(exit) ? "" : Num(Math.Round(exit, 2)), Num(points),
+                    double.IsNaN(points) ? "" : Num(Math.Round(points / TickSize, 2)), Num(pnl),
+                    $"{(int)dur.TotalHours}:{dur.Minutes:00}:{dur.Seconds:00}",
+                    Hms(info.SignalStart), Px(info.SigO), Px(info.SigH), Px(info.SigL), Px(info.SigC), Px(info.PrevH), Px(info.PrevL),
+                    Px(info.Trigger), info.EntryType, Px(info.Limit), Px(info.InitialSL),
+                    double.IsNaN(info.InitialSL) ? "" : Num(Math.Round(Math.Abs(entry - info.InitialSL) / TickSize, 2)),
+                    st.TemplateName, st.Log == null ? "" : info.MaxRisk.ToString(), Px(info.T1Price), Px(info.T2Price),
+                    t1.Count > 0 ? Px(AvgPrice(t1)) : "", t1.Count > 0 ? Hms(t1[t1.Count - 1].Time) : "",
+                    rest.Count > 0 ? Px(AvgPrice(rest)) : "", rest.Count > 0 ? Hms(rest[rest.Count - 1].Time) : "",
+                    reason, string.Join(" | ", st.ManualChanges).Replace(";", ","), Px(info.DistEma),
+                    st.Surprised ? "yes" : "no"
+                };
+                bool isNew = !System.IO.File.Exists(tradeLogPath);
+                using (System.IO.StreamWriter w = new System.IO.StreamWriter(tradeLogPath, true, new System.Text.UTF8Encoding(isNew)))
+                {
+                    if (isNew) w.Write(TradeLogHeader + "\r\n");
+                    w.Write(string.Join(";", cols) + "\r\n");
+                }
+                Print($"[{DateTime.Now.ToString("HH:mm:ss.fff")}] JOURNAL {(sign > 0 ? "LONG" : "SHORT")} {qty} {Num(entry)} -> {(double.IsNaN(exit) ? "?" : Num(Math.Round(exit, 2)))}  PnL {Num(pnl)}  ({(info.Setup + " " + st.TemplateName).Trim()})");
+            }
+            catch (Exception ex)
+            {
+                Print($"[{DateTime.Now.ToString("HH:mm:ss.fff")}] WARNING: trade log {tradeLogPath} not written ({ex.Message}).");
+            }
+        }
+
+        #endregion
+
+        // Die Position hat die Box beim Oeffnen uebernommen: Box leeren (UI-Thread).
+        private void ClearSurprisedBox()
+        {
+            surprisedArmed = false;
+            if (ChartControl != null && surprisedCheckBox != null)
+                ChartControl.Dispatcher.InvokeAsync(() => { if (surprisedCheckBox.IsChecked == true) surprisedCheckBox.IsChecked = false; });
         }
 
         private void UpdateClimaxUi(string overrideText = null)
@@ -1411,7 +1765,7 @@ namespace NinjaTrader.NinjaScript.Strategies
 
             // Achtung Reihenfolge: (limitPrice, stopPrice, ...). Targets sind Limit-Orders,
             // der Preis gehoert also in den ERSTEN Parameter (Stops in den zweiten).
-            AtmStrategyChangeStopTarget(price, 0, targetName, atmId);
+            ChangeStopTargetLogged(price, 0, targetName, atmId);
             return true;
         }
 
@@ -1501,6 +1855,8 @@ namespace NinjaTrader.NinjaScript.Strategies
                 }; 
             }
             
+            TradeLogInfo momLog = MakeLogInfo("Momentum Long", entryPrice, double.NaN, intendedStop);
+            lock(listLock) { trackedAtms[atmId].Log = momLog; }
             if(c0 >= entryPrice) AtmStrategyCreate(OrderAction.Buy, OrderType.Limit, limitPrice, 0, TimeInForce.Gtc, uniqueOrderId, selectedAtm, atmId, (errorCode, errorMessage) => OnAtmCreateResult(errorCode, errorMessage, atmId, selectedAtm));
             else AtmStrategyCreate(OrderAction.Buy, OrderType.StopLimit, limitPrice, entryPrice, TimeInForce.Gtc, uniqueOrderId, selectedAtm, atmId, (errorCode, errorMessage) => OnAtmCreateResult(errorCode, errorMessage, atmId, selectedAtm));
         }
@@ -1563,6 +1919,8 @@ namespace NinjaTrader.NinjaScript.Strategies
                 }; 
             }
             
+            TradeLogInfo momLog = MakeLogInfo("Momentum Short", entryPrice, double.NaN, intendedStop);
+            lock(listLock) { trackedAtms[atmId].Log = momLog; }
             if(c0 <= entryPrice) AtmStrategyCreate(OrderAction.Sell, OrderType.Limit, limitPrice, 0, TimeInForce.Gtc, uniqueOrderId, selectedAtm, atmId, (errorCode, errorMessage) => OnAtmCreateResult(errorCode, errorMessage, atmId, selectedAtm));
             else AtmStrategyCreate(OrderAction.Sell, OrderType.StopLimit, limitPrice, entryPrice, TimeInForce.Gtc, uniqueOrderId, selectedAtm, atmId, (errorCode, errorMessage) => OnAtmCreateResult(errorCode, errorMessage, atmId, selectedAtm));
         }
@@ -1627,6 +1985,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             trapBarNumber = bar;
             trapNoRunnerLong = noRunner;
             trapAtmTemplateLong = templateLong;
+            trapLogLong = MakeLogInfo(noRunner ? "Smart Long (No Runner)" : "Smart Long", trapTriggerPrice, trapLimitPrice, trapStopLossPrice);
             trapLongActive = true;
             trapShortActive = false; 
             
@@ -1697,6 +2056,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             trapBarNumber = bar;
             trapNoRunnerShort = noRunner;
             trapAtmTemplateShort = templateShort;
+            trapLogShort = MakeLogInfo(noRunner ? "Smart Short (No Runner)" : "Smart Short", trapTriggerPrice, trapLimitPrice, trapStopLossPrice);
             trapShortActive = true;
             trapLongActive = false; 
             
@@ -1750,7 +2110,8 @@ namespace NinjaTrader.NinjaScript.Strategies
 
             trapBarNumber = bar;
             trapNoRunnerLong = false;
-            trapAtmTemplateLong = availableAtms[currentAtmIndex]; 
+            trapAtmTemplateLong = availableAtms[currentAtmIndex];
+            trapLogLong = MakeLogInfo("Deep Long", trapTriggerPrice, trapLimitPrice, trapStopLossPrice);
             trapLongActive = true;
             trapShortActive = false; 
             
@@ -1803,9 +2164,10 @@ namespace NinjaTrader.NinjaScript.Strategies
 
             trapBarNumber = bar;
             trapNoRunnerShort = false;
-            trapAtmTemplateShort = availableAtms[currentAtmIndex]; 
+            trapAtmTemplateShort = availableAtms[currentAtmIndex];
+            trapLogShort = MakeLogInfo("Deep Short", trapTriggerPrice, trapLimitPrice, trapStopLossPrice);
             trapLongActive = false;
-            trapShortActive = true; 
+            trapShortActive = true;
             
             Draw.HorizontalLine(this, "TrapTrigger", trapTriggerPrice, Brushes.Orange, DashStyleHelper.Dash, 2);
             Draw.HorizontalLine(this, "TrapLimit", trapLimitPrice, Brushes.DarkCyan, DashStyleHelper.Solid, 2);
@@ -1880,7 +2242,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             string orderState = status[0, 2];
             if (orderState != "Accepted" && orderState != "Working") return;
 
-            AtmStrategyChangeStopTarget(0, price, RunnerStopName, state.AtmId);
+            ChangeStopTargetLogged(0, price, RunnerStopName, state.AtmId);
             state.CurrentRunnerStop = price;
             RemoveDrawObject("BE_Notice");
             Draw.TextFixed(this, "Trail_Notice", $"TRAIL: {RunnerStopName} secured at {price}", TextPosition.BottomRight, Brushes.DeepSkyBlue, new NinjaTrader.Gui.Tools.SimpleFont("Arial", 12) { Bold = true }, Brushes.Transparent, Brushes.Transparent, 0);
@@ -1902,11 +2264,15 @@ namespace NinjaTrader.NinjaScript.Strategies
                 cHigh1 = High[1];
                 cLow1 = Low[1];
                 cClose1 = Close[1];
-                cOpen1 = Open[1]; 
+                cOpen1 = Open[1];
                 cClose0 = Close[0];
+                cSignalStart = Time[2];                    // Start der Signal-Bar = Ende der Vorbar
+                cEma1 = EMA(Close, JournalEmaPeriod)[1];
                 cBar = CurrentBar;
                 cTickSize = TickSize;
             }
+
+            if (pendingLogs.Count > 0) TryFlushLogs(false);
 
             if (trapLongActive && CurrentBar > trapBarNumber) { trapLongActive = false; RemoveDrawObject("TrapTrigger"); RemoveDrawObject("TrapLimit"); }
             if (trapShortActive && CurrentBar > trapBarNumber) { trapShortActive = false; RemoveDrawObject("TrapTrigger"); RemoveDrawObject("TrapLimit"); }
@@ -1918,7 +2284,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 string atmId = GetAtmStrategyUniqueId();
                 string uniqueOrderId = "TrapLong_" + atmId;
                 
-                lock(listLock) { trackedAtms[atmId] = new AtmState { AtmId = atmId, EntryOrderId = uniqueOrderId, Direction = AtmDirection.Long, EntryPrice = 0, BeTriggered = false, IntendedStopPrice = trapStopLossPrice, TriggerPrice = trapTriggerPrice, SetupBarIndex = cBar, Stop1Adjusted = false, RunnerStopAdjusted = false, DisplayNotified = false, ScratchTargetPrice = 0, HasRunner = !trapNoRunnerLong, TemplateName = trapAtmTemplateLong, CreatedAt = DateTime.Now }; }
+                lock(listLock) { trackedAtms[atmId] = new AtmState { AtmId = atmId, EntryOrderId = uniqueOrderId, Direction = AtmDirection.Long, EntryPrice = 0, BeTriggered = false, IntendedStopPrice = trapStopLossPrice, TriggerPrice = trapTriggerPrice, SetupBarIndex = cBar, Stop1Adjusted = false, RunnerStopAdjusted = false, DisplayNotified = false, ScratchTargetPrice = 0, HasRunner = !trapNoRunnerLong, TemplateName = trapAtmTemplateLong, CreatedAt = DateTime.Now, Log = trapLogLong }; }
                 AtmStrategyCreate(OrderAction.Buy, OrderType.Limit, trapLimitPrice, 0, TimeInForce.Gtc, uniqueOrderId, trapAtmTemplateLong, atmId, (errorCode, errorMessage) => OnAtmCreateResult(errorCode, errorMessage, atmId, trapAtmTemplateLong));
             }
 
@@ -1929,7 +2295,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 string atmId = GetAtmStrategyUniqueId();
                 string uniqueOrderId = "TrapShort_" + atmId;
                 
-                lock(listLock) { trackedAtms[atmId] = new AtmState { AtmId = atmId, EntryOrderId = uniqueOrderId, Direction = AtmDirection.Short, EntryPrice = 0, BeTriggered = false, IntendedStopPrice = trapStopLossPrice, TriggerPrice = trapTriggerPrice, SetupBarIndex = cBar, Stop1Adjusted = false, RunnerStopAdjusted = false, DisplayNotified = false, ScratchTargetPrice = 0, HasRunner = !trapNoRunnerShort, TemplateName = trapAtmTemplateShort, CreatedAt = DateTime.Now }; }
+                lock(listLock) { trackedAtms[atmId] = new AtmState { AtmId = atmId, EntryOrderId = uniqueOrderId, Direction = AtmDirection.Short, EntryPrice = 0, BeTriggered = false, IntendedStopPrice = trapStopLossPrice, TriggerPrice = trapTriggerPrice, SetupBarIndex = cBar, Stop1Adjusted = false, RunnerStopAdjusted = false, DisplayNotified = false, ScratchTargetPrice = 0, HasRunner = !trapNoRunnerShort, TemplateName = trapAtmTemplateShort, CreatedAt = DateTime.Now, Log = trapLogShort }; }
                 AtmStrategyCreate(OrderAction.Sell, OrderType.Limit, trapLimitPrice, 0, TimeInForce.Gtc, uniqueOrderId, trapAtmTemplateShort, atmId, (errorCode, errorMessage) => OnAtmCreateResult(errorCode, errorMessage, atmId, trapAtmTemplateShort));
             }
 
@@ -2016,9 +2382,22 @@ namespace NinjaTrader.NinjaScript.Strategies
                         // Sobald die Position einmal da war und jetzt weg ist, ist die ATM terminiert.
                         // Ab hier keine Statusabfragen mehr, sonst loggt NT "ATM strategy ID does not exist".
                         int atmQty = state.EntryPrice != 0 ? GetAtmStrategyPositionQuantity(state.AtmId) : 0;
+                        if (atmQty > 0 && !state.PositionSeen)
+                        {
+                            // Position oeffnet: "SURPRISED" zaehlt nur, wenn die Box schon vorher angehakt war.
+                            state.OpenedAt = Time[0];
+                            state.Surprised = surprisedArmed;
+                            if (surprisedArmed)
+                            {
+                                Print($"[{DateTime.Now.ToString("HH:mm:ss.fff")}] Trade marked as surprised ({state.TemplateName}, {state.Direction}).");
+                                ClearSurprisedBox();
+                            }
+                        }
                         if (atmQty > 0) state.PositionSeen = true;
                         if (state.PositionSeen && atmQty == 0)
                         {
+                            Print($"[{DateTime.Now.ToString("HH:mm:ss.fff")}] Trade closed ({state.TemplateName}, {state.Direction}), surprised: {(state.Surprised ? "yes" : "no")}.");
+                            if (!state.Closed) { state.Closed = true; state.ClosedSeen = DateTime.Now; pendingLogs.Add(state); }
                             // Position ist zu (Stop/Target), aber eine Restmenge der Entry-Order kann
                             // noch im Markt haengen -> sonst wirft sie uns spaeter erneut in eine Position.
                             if (!state.EntryComplete && !state.EntryCancelRequested)
@@ -2088,7 +2467,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                                     string status = s1Status[0, 2];
                                     if (status == "Accepted" || status == "Working")
                                     {
-                                        AtmStrategyChangeStopTarget(0, state.IntendedStopPrice, Stop1Name, state.AtmId);
+                                        ChangeStopTargetLogged(0, state.IntendedStopPrice, Stop1Name, state.AtmId);
                                         state.Stop1Adjusted = true;
                                     }
                                 }
@@ -2104,7 +2483,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                                     string status = s2Status[0, 2];
                                     if (status == "Accepted" || status == "Working")
                                     {
-                                        AtmStrategyChangeStopTarget(0, state.IntendedStopPrice, RunnerStopName, state.AtmId);
+                                        ChangeStopTargetLogged(0, state.IntendedStopPrice, RunnerStopName, state.AtmId);
                                         state.RunnerStopAdjusted = true;
                                         state.CurrentRunnerStop = state.IntendedStopPrice;
                                     }
@@ -2135,7 +2514,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                                             : state.EntryPrice - (AutoBreakevenOffset * cTickSize);
                                     }
 
-                                    AtmStrategyChangeStopTarget(0, bePrice, RunnerStopName, state.AtmId);
+                                    ChangeStopTargetLogged(0, bePrice, RunnerStopName, state.AtmId);
                                     state.BeTriggered = true;
                                     state.CurrentRunnerStop = bePrice;
                                     
