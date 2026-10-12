@@ -81,6 +81,7 @@ namespace NinjaTrader.NinjaScript.Strategies
         public int MaxRisk;
         public double DistEma = double.NaN;    // Close der Signal-Bar minus EMA, Punkte
         public double T1Price = double.NaN, T2Price = double.NaN;   // geplante Targets (erster Preis nach dem Fill)
+        public DateTime ArmedAt = DateTime.MinValue;   // Bar-Zeit beim Scharfmachen (Zeile fuer Setups ohne Trade)
     }
 
     public class LogFill
@@ -255,6 +256,7 @@ namespace NinjaTrader.NinjaScript.Strategies
         private List<AtmState> pendingLogs = new List<AtmState>();   // geschlossen, Zeile noch nicht geschrieben
         private TradeLogInfo trapLogLong, trapLogShort;
         private DateTime cSignalStart;
+        private DateTime cTime0;                   // Zeit des letzten Ticks (Bar-Zeit, auch im Playback richtig)
         private double cEma1;
         private DateTime lockoutTradingDay = DateTime.MinValue;
         private int lossesToday = 0;
@@ -917,8 +919,10 @@ namespace NinjaTrader.NinjaScript.Strategies
 
         private void ReportAtmCreateFailure(ErrorCode errorCode, string errorMessage, string atmId, string templateName)
         {
-            lock(listLock) { trackedAtms.Remove(atmId); }
-            SetupEndedWithoutTrade("ATM create failed");
+            AtmState failed;
+            lock(listLock) { trackedAtms.TryGetValue(atmId, out failed); trackedAtms.Remove(atmId); }
+            if (failed != null) AtmEndedWithoutTrade(failed, "ATM create failed");
+            else SetupEndedWithoutTrade("ATM create failed");
 
             string detail = string.IsNullOrWhiteSpace(errorMessage) ? errorCode.ToString() : $"{errorCode} - {errorMessage}";
             Draw.TextFixed(this, "SmartOrderError", $"ATM CREATE FAILED (template '{templateName}')\n{detail}", TextPosition.Center, Brushes.Red, new NinjaTrader.Gui.Tools.SimpleFont("Arial", 12) { Bold = true }, Brushes.Transparent, Brushes.Transparent, 0);
@@ -953,8 +957,8 @@ namespace NinjaTrader.NinjaScript.Strategies
             climaxActive = true;
 
             // Ein bereits scharfer Mit-Trend-Trap wuerde die Pause sonst unterlaufen.
-            if (isBuy && trapLongActive)  { trapLongActive = false;  RemoveDrawObject("TrapTrigger"); RemoveDrawObject("TrapLimit"); SetupEndedWithoutTrade("trap cancelled by climax"); }
-            if (!isBuy && trapShortActive) { trapShortActive = false; RemoveDrawObject("TrapTrigger"); RemoveDrawObject("TrapLimit"); SetupEndedWithoutTrade("trap cancelled by climax"); }
+            if (isBuy && trapLongActive)  { trapLongActive = false;  RemoveDrawObject("TrapTrigger"); RemoveDrawObject("TrapLimit"); TrapEndedWithoutTrade(true, "trap cancelled by climax"); }
+            if (!isBuy && trapShortActive) { trapShortActive = false; RemoveDrawObject("TrapTrigger"); RemoveDrawObject("TrapLimit"); TrapEndedWithoutTrade(false, "trap cancelled by climax"); }
 
             for (int b = anchorAgo - 1; b >= 1; b--) ProcessClimaxBar(b);
 
@@ -1152,6 +1156,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             lock(dataLock)
             {
                 i.SignalStart = cSignalStart;
+                i.ArmedAt = cTime0;
                 i.SigO = cOpen1; i.SigH = cHigh1; i.SigL = cLow1; i.SigC = cClose1;
                 i.PrevH = cHigh2; i.PrevL = cLow2;
                 i.DistEma = cClose1 - cEma1;
@@ -1433,6 +1438,63 @@ namespace NinjaTrader.NinjaScript.Strategies
 
         #endregion
 
+        // Trap (noch ohne ATM) endet ohne Position: Zeile im Trade-Log, dann "SURPRISED" leeren.
+        private void TrapEndedWithoutTrade(bool isLong, string why)
+        {
+            if (isLong) LogNoTrade(why, trapLogLong, true, trapAtmTemplateLong);
+            else LogNoTrade(why, trapLogShort, false, trapAtmTemplateShort);
+            SetupEndedWithoutTrade(why);
+        }
+
+        // ATM-Entry endet ohne Fill (Runway, Bars to Wait, storniert, Create-Fehler): Zeile im Trade-Log, dann "SURPRISED" leeren.
+        private void AtmEndedWithoutTrade(AtmState st, string why)
+        {
+            LogNoTrade(why, st.Log, st.Direction == AtmDirection.Long, st.TemplateName);
+            SetupEndedWithoutTrade(why);
+        }
+
+        // Zeile fuer ein Setup ohne Position (wie record_no_trade im ChartTrader): Qty 0, kein Entry/Exit/PnL,
+        // Open = Scharfmachen, Close = Ende, RiskTicks gegen den geplanten Einstieg, RunnerExitReason = "NoTrade (<Grund>)",
+        // Surprised = Stand der Box beim Ende des Setups.
+        private void LogNoTrade(string why, TradeLogInfo info, bool isLong, string template)
+        {
+            if (string.IsNullOrEmpty(tradeLogPath)) return;
+            try
+            {
+                if (info == null) info = new TradeLogInfo();
+                DateTime ended;
+                lock(dataLock) { ended = cTime0; }
+                DateTime armed = info.ArmedAt != DateTime.MinValue ? info.ArmedAt : ended;
+                double planned = !double.IsNaN(info.Limit) ? info.Limit : info.Trigger;
+                string setup = (info.Setup + " " + template).Trim();
+                string side = isLong ? "LONG" : "SHORT";
+                string[] cols =
+                {
+                    logRunStarted,
+                    armed == DateTime.MinValue ? "" : armed.ToString("yyyy-MM-dd"), Hms(armed), Hms(ended),
+                    LogSymbol(), setup, side, "0", "", "", "", "", "", "",
+                    Hms(info.SignalStart), Px(info.SigO), Px(info.SigH), Px(info.SigL), Px(info.SigC), Px(info.PrevH), Px(info.PrevL),
+                    Px(info.Trigger), info.EntryType, Px(info.Limit), Px(info.InitialSL),
+                    double.IsNaN(info.InitialSL) || double.IsNaN(planned) ? "" : Num(Math.Round(Math.Abs(planned - info.InitialSL) / TickSize, 2)),
+                    template, info.MaxRisk > 0 ? info.MaxRisk.ToString() : "", "", "",
+                    "", "", "", "",
+                    "NoTrade (" + why + ")", "", Px(info.DistEma),
+                    surprisedArmed ? "yes" : "no"
+                };
+                bool isNew = !System.IO.File.Exists(tradeLogPath);
+                using (System.IO.StreamWriter w = new System.IO.StreamWriter(tradeLogPath, true, new System.Text.UTF8Encoding(isNew)))
+                {
+                    if (isNew) w.Write(TradeLogHeader + "\r\n");
+                    w.Write(string.Join(";", cols) + "\r\n");
+                }
+                Print($"[{DateTime.Now.ToString("HH:mm:ss.fff")}] JOURNAL NO TRADE {side} ({setup}): {why}");
+            }
+            catch (Exception ex)
+            {
+                Print($"[{DateTime.Now.ToString("HH:mm:ss.fff")}] WARNING: trade log {tradeLogPath} not written ({ex.Message}).");
+            }
+        }
+
         // Ein Setup endet ohne Position (Trap verfallen, Entry storniert, Cancel All ...): "SURPRISED" galt diesem
         // Setup und wird geleert.
         private void SetupEndedWithoutTrade(string why)
@@ -1609,7 +1671,8 @@ namespace NinjaTrader.NinjaScript.Strategies
             tradingLocked = true;
 
             // Ein bereits scharfer Trap wuerde sonst nach der Sperre noch ausloesen.
-            if (trapLongActive || trapShortActive) SetupEndedWithoutTrade("trading locked");
+            if (trapLongActive) TrapEndedWithoutTrade(true, "trading locked");
+            if (trapShortActive) TrapEndedWithoutTrade(false, "trading locked");
             trapLongActive = false;
             trapShortActive = false;
             RemoveDrawObject("TrapTrigger");
@@ -1767,7 +1830,8 @@ namespace NinjaTrader.NinjaScript.Strategies
 
         private void ExecuteCancel()
         {
-            bool setupPending = trapLongActive || trapShortActive;
+            bool trapLong = trapLongActive, trapShort = trapShortActive;
+            List<AtmState> unfilled = new List<AtmState>();
             trapLongActive = false;
             trapShortActive = false;
             
@@ -1792,11 +1856,14 @@ namespace NinjaTrader.NinjaScript.Strategies
                         // Position wird geschlossen: Zeile im Trade-Log schreiben, sobald die Exits da sind.
                         if (!st.Closed) { st.Closed = true; st.ClosedSeen = DateTime.Now; pendingLogs.Add(st); }
                     }
-                    else setupPending = true;
+                    else unfilled.Add(st);
                 }
                 trackedAtms.Clear();
             }
-            if (setupPending) SetupEndedWithoutTrade("cancel all");
+            if (trapLong) LogNoTrade("cancel all", trapLogLong, true, trapAtmTemplateLong);
+            if (trapShort) LogNoTrade("cancel all", trapLogShort, false, trapAtmTemplateShort);
+            foreach (AtmState u in unfilled) LogNoTrade("cancel all", u.Log, u.Direction == AtmDirection.Long, u.TemplateName);
+            if (trapLong || trapShort || unfilled.Count > 0) SetupEndedWithoutTrade("cancel all");
             Print($"[{DateTime.Now.ToString("HH:mm:ss.fff")}] Killswitch activated. All traps and active orders destroyed.");
         }
 
@@ -2383,6 +2450,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 cOpen1 = Open[1];
                 cClose0 = Close[0];
                 cSignalStart = Time[2];                    // Start der Signal-Bar = Ende der Vorbar
+                cTime0 = Time[0];
                 cEma1 = EMA(Close, JournalEmaPeriod)[1];
                 cBar = CurrentBar;
                 cTickSize = TickSize;
@@ -2390,8 +2458,8 @@ namespace NinjaTrader.NinjaScript.Strategies
 
             if (pendingLogs.Count > 0) TryFlushLogs(false);
 
-            if (trapLongActive && CurrentBar > trapBarNumber) { trapLongActive = false; RemoveDrawObject("TrapTrigger"); RemoveDrawObject("TrapLimit"); SetupEndedWithoutTrade("trap expired"); }
-            if (trapShortActive && CurrentBar > trapBarNumber) { trapShortActive = false; RemoveDrawObject("TrapTrigger"); RemoveDrawObject("TrapLimit"); SetupEndedWithoutTrade("trap expired"); }
+            if (trapLongActive && CurrentBar > trapBarNumber) { trapLongActive = false; RemoveDrawObject("TrapTrigger"); RemoveDrawObject("TrapLimit"); TrapEndedWithoutTrade(true, "trap expired"); }
+            if (trapShortActive && CurrentBar > trapBarNumber) { trapShortActive = false; RemoveDrawObject("TrapTrigger"); RemoveDrawObject("TrapLimit"); TrapEndedWithoutTrade(false, "trap expired"); }
 
             if (trapLongActive && !tradingLocked && High[0] >= trapTriggerPrice)
             {
@@ -2679,7 +2747,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                     {
                         AtmState gone;
                         if (trackedAtms.TryGetValue(id, out gone) && !gone.PositionSeen && gone.EntryPrice == 0 && gone.EntryFills.Count == 0)
-                            SetupEndedWithoutTrade("entry not filled");
+                            AtmEndedWithoutTrade(gone, "entry not filled");
                         trackedAtms.Remove(id);
                         RemoveDrawObject("BE_Notice");
                         RemoveDrawObject("Trail_Notice");
