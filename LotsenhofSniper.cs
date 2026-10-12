@@ -882,6 +882,7 @@ namespace NinjaTrader.NinjaScript.Strategies
         private void ReportAtmCreateFailure(ErrorCode errorCode, string errorMessage, string atmId, string templateName)
         {
             lock(listLock) { trackedAtms.Remove(atmId); }
+            SetupEndedWithoutTrade("ATM create failed");
 
             string detail = string.IsNullOrWhiteSpace(errorMessage) ? errorCode.ToString() : $"{errorCode} - {errorMessage}";
             Draw.TextFixed(this, "SmartOrderError", $"ATM CREATE FAILED (template '{templateName}')\n{detail}", TextPosition.Center, Brushes.Red, new NinjaTrader.Gui.Tools.SimpleFont("Arial", 12) { Bold = true }, Brushes.Transparent, Brushes.Transparent, 0);
@@ -916,8 +917,8 @@ namespace NinjaTrader.NinjaScript.Strategies
             climaxActive = true;
 
             // Ein bereits scharfer Mit-Trend-Trap wuerde die Pause sonst unterlaufen.
-            if (isBuy && trapLongActive)  { trapLongActive = false;  RemoveDrawObject("TrapTrigger"); RemoveDrawObject("TrapLimit"); }
-            if (!isBuy && trapShortActive) { trapShortActive = false; RemoveDrawObject("TrapTrigger"); RemoveDrawObject("TrapLimit"); }
+            if (isBuy && trapLongActive)  { trapLongActive = false;  RemoveDrawObject("TrapTrigger"); RemoveDrawObject("TrapLimit"); SetupEndedWithoutTrade("trap cancelled by climax"); }
+            if (!isBuy && trapShortActive) { trapShortActive = false; RemoveDrawObject("TrapTrigger"); RemoveDrawObject("TrapLimit"); SetupEndedWithoutTrade("trap cancelled by climax"); }
 
             for (int b = anchorAgo - 1; b >= 1; b--) ProcessClimaxBar(b);
 
@@ -1344,6 +1345,15 @@ namespace NinjaTrader.NinjaScript.Strategies
 
         #endregion
 
+        // Ein Setup endet ohne Position (Trap verfallen, Entry storniert, Cancel All ...): "SURPRISED" galt diesem
+        // Setup und wird geleert.
+        private void SetupEndedWithoutTrade(string why)
+        {
+            if (!surprisedArmed) return;
+            Print($"[{DateTime.Now.ToString("HH:mm:ss.fff")}] Surprised cleared: setup ended without a trade ({why}).");
+            ClearSurprisedBox();
+        }
+
         // Die Position hat die Box beim Oeffnen uebernommen: Box leeren (UI-Thread).
         private void ClearSurprisedBox()
         {
@@ -1511,6 +1521,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             tradingLocked = true;
 
             // Ein bereits scharfer Trap wuerde sonst nach der Sperre noch ausloesen.
+            if (trapLongActive || trapShortActive) SetupEndedWithoutTrade("trading locked");
             trapLongActive = false;
             trapShortActive = false;
             RemoveDrawObject("TrapTrigger");
@@ -1668,6 +1679,7 @@ namespace NinjaTrader.NinjaScript.Strategies
 
         private void ExecuteCancel()
         {
+            bool setupPending = trapLongActive || trapShortActive;
             trapLongActive = false;
             trapShortActive = false;
             
@@ -1685,10 +1697,18 @@ namespace NinjaTrader.NinjaScript.Strategies
                 foreach (var kvp in trackedAtms)
                 {
                     AtmStrategyCancelEntryOrder(kvp.Value.EntryOrderId);
-                    AtmStrategyClose(kvp.Key); 
+                    AtmStrategyClose(kvp.Key);
+                    AtmState st = kvp.Value;
+                    if (st.PositionSeen || st.EntryFills.Count > 0)
+                    {
+                        // Position wird geschlossen: Zeile im Trade-Log schreiben, sobald die Exits da sind.
+                        if (!st.Closed) { st.Closed = true; st.ClosedSeen = DateTime.Now; pendingLogs.Add(st); }
+                    }
+                    else setupPending = true;
                 }
                 trackedAtms.Clear();
             }
+            if (setupPending) SetupEndedWithoutTrade("cancel all");
             Print($"[{DateTime.Now.ToString("HH:mm:ss.fff")}] Killswitch activated. All traps and active orders destroyed.");
         }
 
@@ -2274,8 +2294,8 @@ namespace NinjaTrader.NinjaScript.Strategies
 
             if (pendingLogs.Count > 0) TryFlushLogs(false);
 
-            if (trapLongActive && CurrentBar > trapBarNumber) { trapLongActive = false; RemoveDrawObject("TrapTrigger"); RemoveDrawObject("TrapLimit"); }
-            if (trapShortActive && CurrentBar > trapBarNumber) { trapShortActive = false; RemoveDrawObject("TrapTrigger"); RemoveDrawObject("TrapLimit"); }
+            if (trapLongActive && CurrentBar > trapBarNumber) { trapLongActive = false; RemoveDrawObject("TrapTrigger"); RemoveDrawObject("TrapLimit"); SetupEndedWithoutTrade("trap expired"); }
+            if (trapShortActive && CurrentBar > trapBarNumber) { trapShortActive = false; RemoveDrawObject("TrapTrigger"); RemoveDrawObject("TrapLimit"); SetupEndedWithoutTrade("trap expired"); }
 
             if (trapLongActive && !tradingLocked && High[0] >= trapTriggerPrice)
             {
@@ -2559,8 +2579,11 @@ namespace NinjaTrader.NinjaScript.Strategies
                         }
                     }
                     
-                    foreach(string id in deadAtms) 
+                    foreach(string id in deadAtms)
                     {
+                        AtmState gone;
+                        if (trackedAtms.TryGetValue(id, out gone) && !gone.PositionSeen && gone.EntryPrice == 0 && gone.EntryFills.Count == 0)
+                            SetupEndedWithoutTrade("entry not filled");
                         trackedAtms.Remove(id);
                         RemoveDrawObject("BE_Notice");
                         RemoveDrawObject("Trail_Notice");
