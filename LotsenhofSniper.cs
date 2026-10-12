@@ -548,7 +548,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 IsOverlay                   = true;
                 
                 AtmTemplatesList            = "WADE10,WADE12,WADE14,WADE16,WADE8,WADE6"; 
-                MaxPullbackPercent          = 49.0; 
+                MaxPullbackPercent          = 76.0; 
                 BlockInsideBars             = true; 
                 MaxSlippageTicks            = 2; 
                 DefaultMaxRiskTicks         = 9; 
@@ -573,8 +573,8 @@ namespace NinjaTrader.NinjaScript.Strategies
                 TrailBufferTicks            = 1;
                 EnableDailyLossLockout      = true;
                 LockoutLiveAccountsOnly     = true;
-                LossesUntilLockout          = 1;
-                MinLossToCount              = 0;
+                LossesUntilLockout          = 2;
+                MinLossToCount              = 50;
                 RequireClosePosition        = true;
                 ClosePositionPercent        = 70;
                 RequireMinBody              = true;
