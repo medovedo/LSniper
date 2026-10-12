@@ -295,6 +295,15 @@ namespace NinjaTrader.NinjaScript.Strategies
         private double climaxBreakoutClose = 0;
         private bool climaxResumed = false;
 
+        // 10K-EMA (EMA 21 einer hoeheren Tick-Serie), wie die rote Linie im ChartTrader: gezeichnet nur durch die
+        // exakten Werte an den Schluessen der 10K-Bars (gerade Strecken dazwischen), das letzte Stueck bis zur
+        // aktuellen Bar ist vorlaeufig (laufende 10K-Bar mit ihrem bisherigen Close).
+        private int htfBip = -1;                                   // BarsInProgress der 10K-Serie, -1 = aus
+        private double htfK, htfEma = double.NaN, htfCurrent = double.NaN;
+        private readonly List<int> htfPointBar = new List<int>();     // Index der 2000er-Bar mit dem letzten Tick der 10K-Bar
+        private readonly List<double> htfPointVal = new List<double>();
+        private int htfDrawn = -1;                                 // letzter fertig gezeichneter Stuetzpunkt
+
         [NinjaScriptProperty]
         [Display(Name="ATM Strategies List", Description="Comma separated list of ATM templates", Order=1, GroupName="1. Parameters")]
         public string AtmTemplatesList { get; set; }
@@ -492,6 +501,20 @@ namespace NinjaTrader.NinjaScript.Strategies
         public int ResumeMinClosePercent { get; set; }
 
         [NinjaScriptProperty]
+        [Display(Name="Show 10K EMA", Description="Rote EMA einer hoeheren Tick-Serie im Chart (wie im ChartTrader). Aus = keine zweite Datenserie, keine Linie. Aenderung wirkt nach dem Neuladen der Strategie.", Order=1, GroupName="9. Higher EMA")]
+        public bool ShowHtfEma { get; set; }
+
+        [NinjaScriptProperty]
+        [Range(1, int.MaxValue)]
+        [Display(Name="Higher Series (Ticks)", Description="Ticks je Bar der hoeheren Serie (10000 = 10K).", Order=2, GroupName="9. Higher EMA")]
+        public int HtfEmaTicks { get; set; }
+
+        [NinjaScriptProperty]
+        [Range(1, 1000)]
+        [Display(Name="EMA Period", Description="Periode der EMA auf den Closes der hoeheren Serie.", Order=3, GroupName="9. Higher EMA")]
+        public int HtfEmaPeriod { get; set; }
+
+        [NinjaScriptProperty]
         [Display(Name="Hotkey LONG (Smart)", Description="Key for Smart Long Entry", Order=1, GroupName="3. Hotkeys")]
         public SniperKey HotkeyLong { get; set; }
 
@@ -563,6 +586,10 @@ namespace NinjaTrader.NinjaScript.Strategies
                 EnableTrendResume           = true;
                 ResumeMinBodyPercent        = 50;
                 ResumeMinClosePercent       = 70;
+                ShowHtfEma                  = true;
+                HtfEmaTicks                 = 10000;
+                HtfEmaPeriod                = 21;
+                AddPlot(new Stroke(Brushes.Red, 2), PlotStyle.Line, "Ema10K");
                 MaxBreakoutWickPercent      = 25;
                 AllowRejectionBar           = true;
                 RejectionMinClosePercent    = 90;
@@ -575,8 +602,17 @@ namespace NinjaTrader.NinjaScript.Strategies
                 HotkeyCancel                = SniperKey.X;
                 HotkeyScratch               = SniperKey.C;
             }
+            else if (State == State.Configure)
+            {
+                if (ShowHtfEma)
+                {
+                    AddDataSeries(NinjaTrader.Data.BarsPeriodType.Tick, HtfEmaTicks);
+                    htfBip = 1;
+                }
+            }
             else if (State == State.DataLoaded)
             {
+                htfK = 2.0 / (HtfEmaPeriod + 1);
                 if (string.IsNullOrWhiteSpace(AtmTemplatesList))
                 {
                     availableAtms = new string[] { "Default_ATM" };
@@ -1341,6 +1377,58 @@ namespace NinjaTrader.NinjaScript.Strategies
             {
                 Print($"[{DateTime.Now.ToString("HH:mm:ss.fff")}] WARNING: trade log {tradeLogPath} not written ({ex.Message}).");
             }
+        }
+
+        #endregion
+
+        #region 10K EMA
+
+        // BarsInProgress der 10K-Serie. Historisch (ohne Tick Replay) ist [0] die gerade geschlossene Bar,
+        // in Echtzeit (OnEachTick) meldet der erste Tick der neuen Bar den Schluss von [1].
+        private void UpdateHtfEma()
+        {
+            bool historicalBarClose = State == State.Historical && !BarsArray[htfBip].IsTickReplay;
+            int closedAgo = historicalBarClose ? 0 : 1;
+            if ((historicalBarClose || IsFirstTickOfBar) && CurrentBars[htfBip] >= closedAgo)
+            {
+                double c = Closes[htfBip][closedAgo];
+                htfEma = double.IsNaN(htfEma) ? c : htfEma + htfK * (c - htfEma);
+                int idx = BarsArray[0].GetBar(Times[htfBip][closedAgo]);
+                int n = htfPointBar.Count;
+                if (n > 0 && idx <= htfPointBar[n - 1]) htfPointVal[n - 1] = htfEma;   // gleiche Chart-Bar: Wert ersetzen
+                else { htfPointBar.Add(idx); htfPointVal.Add(htfEma); }
+            }
+            double last = Closes[htfBip][0];
+            htfCurrent = historicalBarClose ? htfEma : (double.IsNaN(htfEma) ? last : htfEma + htfK * (last - htfEma));
+        }
+
+        private void SetHtfPlot(int barIndex, double value)
+        {
+            int ago = CurrentBar - barIndex;
+            if (ago >= 0 && ago < 250) Values[0][ago] = value;
+        }
+
+        // Chart-Serie: neue Stuetzpunkte mit geraden Strecken verbinden, dann das vorlaeufige Stueck bis zur aktuellen Bar.
+        private void DrawHtfEma()
+        {
+            while (htfDrawn + 1 < htfPointBar.Count && htfPointBar[htfDrawn + 1] <= CurrentBar)
+            {
+                int b = htfPointBar[htfDrawn + 1];
+                double vb = htfPointVal[htfDrawn + 1];
+                if (htfDrawn >= 0)
+                {
+                    int a = htfPointBar[htfDrawn];
+                    double va = htfPointVal[htfDrawn];
+                    for (int i = a + 1; i < b; i++) SetHtfPlot(i, va + (vb - va) * (i - a) / (double)(b - a));
+                }
+                SetHtfPlot(b, vb);
+                htfDrawn++;
+            }
+            if (htfDrawn < 0 || double.IsNaN(htfCurrent)) return;
+            int la = htfPointBar[htfDrawn];
+            double lv = htfPointVal[htfDrawn];
+            if (CurrentBar <= la) return;
+            for (int i = la + 1; i <= CurrentBar; i++) SetHtfPlot(i, lv + (htfCurrent - lv) * (i - la) / (double)(CurrentBar - la));
         }
 
         #endregion
@@ -2271,6 +2359,14 @@ namespace NinjaTrader.NinjaScript.Strategies
 
         protected override void OnBarUpdate()
         {
+            // Die 10K-Serie liefert nur die EMA; alle Order- und ATM-Logik laeuft ausschliesslich auf der Chart-Serie.
+            if (BarsInProgress != 0)
+            {
+                if (BarsInProgress == htfBip) UpdateHtfEma();
+                return;
+            }
+            if (htfBip > 0) DrawHtfEma();
+
             if (CurrentBar < 2) return; 
 
             bool isNewBar = IsFirstTickOfBar;
